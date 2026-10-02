@@ -39,8 +39,7 @@ pub fn to_decimal_string(x: &Integer) -> String {
     }
     let neg = x.is_negative();
     let abs = if neg { -x.clone() } else { x.clone() };
-    let mut blocks = Vec::new();
-    convert_to_blocks(&abs, &mut blocks);
+    let blocks = convert_blocks(&abs);
     debug_assert!(!blocks.is_empty());
 
     // Build the final string from the base-RADIX blocks. `blocks` is
@@ -71,11 +70,19 @@ pub fn to_decimal_string(x: &Integer) -> String {
 
 /// Recursively convert `x` into a little-endian vector of base-`RADIX` blocks
 /// (least-significant block first, with internal zero-padding removed). Uses
-/// subquadratic divide-and-conquer splitting.
-fn convert_to_blocks(x: &Integer, out: &mut Vec<u32>) {
+/// subquadratic divide-and-conquer splitting, parallelised at the top levels
+/// (the two halves of each split are independent and can be converted
+/// concurrently) until the numbers are small enough that serialising them is
+/// more efficient.
+fn convert_blocks(x: &Integer) -> Vec<u32> {
+    convert_blocks_depth(x, 0)
+}
+
+const PAR_DEPTH: usize = 6;
+
+fn convert_blocks_depth(x: &Integer, depth: usize) -> Vec<u32> {
     if x < &Integer::from(RADIX) {
-        out.push(x.to_u32().expect("fits in u32"));
-        return;
+        return vec![x.to_u32().expect("fits in u32")];
     }
 
     // Choose a power of the radix, R^m, about half the size of x, so we can
@@ -85,11 +92,19 @@ fn convert_to_blocks(x: &Integer, out: &mut Vec<u32>) {
     let hi = Integer::from(x / &rpow);
     let lo = Integer::from(x % &rpow);
 
-    // Convert the low part first (least significant), then the high part.
-    let mut lo_blocks = Vec::new();
-    convert_to_blocks(&lo, &mut lo_blocks);
-    let mut hi_blocks = Vec::new();
-    convert_to_blocks(&hi, &mut hi_blocks);
+    // Convert the low part first (least significant), then the high part. The
+    // two are independent, so at the top levels we convert them in parallel.
+    let (mut lo_blocks, hi_blocks) = if depth < PAR_DEPTH {
+        rayon::join(
+            || convert_blocks_depth(&lo, depth + 1),
+            || convert_blocks_depth(&hi, depth + 1),
+        )
+    } else {
+        (
+            convert_blocks_depth(&lo, depth + 1),
+            convert_blocks_depth(&hi, depth + 1),
+        )
+    };
 
     // Pad the low part to exactly m blocks so that the high part lands at the
     // correct (m-th) block position. Internal zero-blocks must be preserved
@@ -97,8 +112,8 @@ fn convert_to_blocks(x: &Integer, out: &mut Vec<u32>) {
     while lo_blocks.len() < m {
         lo_blocks.push(0);
     }
-    out.extend_from_slice(&lo_blocks);
-    out.extend_from_slice(&hi_blocks);
+    lo_blocks.extend_from_slice(&hi_blocks);
+    lo_blocks
 }
 
 /// Estimate a power `m` such that `RADIX^m` is about √|x|.

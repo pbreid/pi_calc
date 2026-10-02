@@ -246,13 +246,18 @@ pub fn compute_pi(cfg: &PiConfig) -> PiResult {
     let (q, t, n_terms) = chudnovsky_split(cfg);
     let q2 = Integer::from(&q * &q);
 
+    // The irrational root `R = isqrt(426880²·10005·Q²)` is shared by both the
+    // decimal and hexadecimal scalings. Because `T ≫ base^exp` (see
+    // [`scaled_integer`]), this is exact for the requested number of digits.
+    let r = chudnovsky_root(&q2);
+
     let d = digits + guard;
-    let scaled = scaled_integer(&q2, &t, 10, d);
+    let scaled = scaled_integer(&r, &t, 10, d);
 
     // The hex-scaled integer for verification, with a number of hex digits
     // that covers the whole computed range plus margin.
     let hex_len = hex_digit_capacity(d);
-    let hex_scaled = scaled_integer(&q2, &t, 16, hex_len);
+    let hex_scaled = scaled_integer(&r, &t, 16, hex_len);
 
     PiResult { scaled, hex_scaled, digits, guard, n_terms, hex_len }
 }
@@ -274,15 +279,31 @@ fn integer_pow(base: u64, exp: usize) -> Integer {
     Integer::from(Integer::u_pow_u(base as u32, exp as u32))
 }
 
-/// `floor(π · base^exp)` computed exactly from `q2 = Q²` and `t = T`.
-pub fn scaled_integer(q2: &Integer, t: &Integer, base: u64, exp: usize) -> Integer {
-    let base_pow = integer_pow(base, 2 * exp);
-    let m = Integer::from(PI_K).square()
-        * Integer::from(TEN_THOUSAND_FIVE)
-        * q2
-        * base_pow;
-    let root = isqrt(&m);
-    Integer::from(root / t)
+/// `R = isqrt(426880²·10005·Q²)`.
+///
+/// This is the integer part of `√10005 · 426880 · Q`, i.e. the irrational
+/// mantissa of π before the rational denominator `T`. It is shared between the
+/// decimal and hexadecimal scalings.
+pub fn chudnovsky_root(q2: &Integer) -> Integer {
+    let x = Integer::from(PI_K).square() * Integer::from(TEN_THOUSAND_FIVE) * q2;
+    isqrt(&x)
+}
+
+/// `floor(π · base^exp)` computed exactly, given `R = isqrt(426880²·10005·Q²)`
+/// and `t = T`.
+///
+/// We use `π = (R+δ)/T` with `0 ≤ δ < 1` (since `R = floor(√(426880²·10005·Q²))`
+/// and `T` is the Chudnovsky denominator). Then
+/// `floor(π·base^exp) = floor(R·base^exp/T)` provided `δ·base^exp/T < 1`. Since
+/// `T ≫ base^exp` (the Chudnovsky denominator is vastly larger than the output
+/// in magnitude), this correction is astronomically small, so the result is
+/// exact for all the digits we keep. This avoids computing the huge
+/// `base^(2·exp)` power and the very large `isqrt(base^(2·exp)·…)` that a
+/// naive scaling would require.
+pub fn scaled_integer(r: &Integer, t: &Integer, base: u64, exp: usize) -> Integer {
+    let base_pow = integer_pow(base, exp);
+    let scaled = r * base_pow;
+    Integer::from(scaled / t)
 }
 
 /// `log10(16)` inverse = 1/log10(16) ≈ 0.83048 (converts decimal digits to hex
@@ -297,81 +318,44 @@ pub fn hex_digit_capacity(d: usize) -> usize {
 
 /// Parallel top-level driver. Splits `[0, n)` into `threads` contiguous
 /// ranges, computes each independently on its own thread, and merges the
-/// results deterministically (left fold) so the result does not depend on
-/// scheduling.
-fn chudnovsky_parallel(n: usize, this_threads: usize) -> (Integer, Integer, Integer) {
+/// Parallel top-level driver for the Chudnovsky binary splitting.
+///
+/// We recurse with `rayon::join` so that the *entire* binary-splitting tree —
+/// including the large merges near the top, which were previously serialised
+/// — is scheduled across all cores by work-stealing. This both removes the
+/// serial left-fold merge that dominated the top levels and dynamically
+/// balances the load (no fixed per-thread assignment that can be imbalanced).
+///
+/// `this_threads` is the desired worker count.
+pub fn chudnovsky_parallel(
+    n: usize,
+    this_threads: usize,
+) -> (Integer, Integer, Integer) {
     let threads = this_threads.max(1).min(n.max(1));
     if threads == 1 || n <= 1 {
         return chudnovsky_bs(0, n);
     }
-
-    let bounds = balanced_partition(n, threads);
-
-    std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(bounds.len());
-        for (a, b) in bounds {
-            handles.push(s.spawn(move || chudnovsky_bs(a, b)));
-        }
-        let mut results: Vec<(Integer, Integer, Integer)> =
-            handles.into_iter().map(|h| h.join().unwrap()).collect();
-        // Deterministic left-fold merge.
-        let mut acc = results.remove(0);
-        for seg in results {
-            acc = merge(acc, seg);
-        }
-        acc
-    })
+    // Split into enough independent subtrees to give the scheduler plenty of
+    // work to steal without excessive task overhead. ~threads*4 leaves is far
+    // more than we can run concurrently, which lets work-stealing balance.
+    let leaf = ((n / (threads * 4)).max(64)) as usize;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("failed to build rayon pool");
+    pool.install(|| bs_par(0, n, leaf))
 }
 
-/// Split `[0,n)` into `threads` segments of approximately balanced *work*.
-///
-/// The cost of computing the binary-splitting products over an index `k` is
-/// proportional to the bit-length of the numbers involved, which grows
-/// linearly with `k`. The total cost of a range `[a,b)` is therefore
-/// proportional to `∫_a^b k·dk = (b²−a²)/2`. To equalise work we partition so
-/// that each segment has an equal share of `(b²−a²)`, i.e. the index widths
-/// shrink toward the high end where the numbers are large.
-fn balanced_partition(n: usize, threads: usize) -> Vec<(usize, usize)> {
-    if threads <= 1 {
-        return vec![(0, n)];
+/// Recursively binary-split `[a,b)` in parallel using `rayon::join` until the
+/// range is small enough to compute serially. The merge is exact and
+/// associative, so the result is deterministic regardless of scheduling.
+fn bs_par(a: usize, b: usize, leaf: usize) -> (Integer, Integer, Integer) {
+    if b - a <= leaf {
+        return chudnovsky_bs(a, b);
     }
-    let total = (n * n) as u128; // ∝ ∫_0^n 2k dk = n²
-    let mut bounds = Vec::with_capacity(threads + 1);
-    bounds.push(0usize);
-    let mut prev = 0usize;
-    for i in 1..=threads {
-        let share = total * (i as u128) / (threads as u128);
-        let mut bound = ((share as f64).sqrt() as usize).min(n);
-        if bound <= prev {
-            bound = (prev + 1).min(n);
-        }
-        bounds.push(bound);
-        prev = bound;
-    }
-    if let Some(last) = bounds.last_mut() {
-        if *last < n {
-            *last = n;
-        }
-    }
-    // Build strictly increasing, non-empty segments.
-    let mut out = Vec::new();
-    for w in bounds.windows(2) {
-        let a = w[0];
-        let mut b = w[1];
-        if b < a {
-            b = a;
-        }
-        if b == a && a + 1 <= n {
-            b = a + 1;
-        }
-        if b > a {
-            out.push((a, b));
-        }
-    }
-    if out.is_empty() {
-        out.push((0, n));
-    }
-    out
+    let m = a + (b - a) / 2;
+    let (left, right) = rayon::join(|| bs_par(a, m, leaf), || bs_par(m, b, leaf));
+    merge(left, right)
 }
 
 /// Brute-force the Chudnovsky partial sum in exact rational arithmetic for
