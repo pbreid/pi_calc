@@ -19,7 +19,6 @@
 //!
 //! # Binary splitting
 //!
-//! The partial sum is computed with the classic divide-and-conquer recurrence.
 //! For a range `[a,b)` we maintain integer triples `(P, Q, T)` defined so that
 //! `T(a,b) / Q(a,b)` equals `Σ_{k=a}^{b-1} s_k`. The base case for a single
 //! index `k≥1` uses the reduced factors
@@ -28,26 +27,72 @@
 //! p_k = (6k−5)·(2k−1)·(6k−1),      q_k = k³ · C3 / 24
 //! ```
 //!
-//! These arise after cancelling the common factors between `(6k)!/((3k)!(k!)^3)`
-//! and the denominator. The alternating sign `(−1)^k` is folded into `p_k`
-//! (i.e. `p_k` is negated), and the `k=0` term is handled specially (`s_0=A`).
-//!
-//! The merge step is:
+//! The alternating sign `(−1)^k` is folded into `p_k`, and `k=0` is handled
+//! specially (`s_0 = A`). The merge step is:
 //!
 //! ```text
-//! P(a,b) = P(a,m)·P(m,b)
 //! Q(a,b) = Q(a,m)·Q(m,b)
 //! T(a,b) = T(a,m)·Q(m,b) + P(a,m)·T(m,b)
+//! P(a,b) = P(a,m)·P(m,b)            (only when needed)
 //! ```
 //!
-//! with `m = (a+b)/2`. This is exact integer arithmetic; the number of
-//! big-integer multiplications is roughly linear in the number of terms
-//! (times a log factor), rather than quadratic, which is why binary splitting
-//! is fast.
+//! Note that the numerator `P` of the *whole* range is never needed: `π`
+//! depends only on `Q` and `T`, and the merge only ever needs the `P` of a
+//! **left** child (it appears in `T(a,m)·Q(m,b) + P(a,m)·T(m,b)`). The right
+//! spine of the recursion (nodes that are right children of a node whose `P`
+//! is not needed) therefore never has to compute `P` at all. Skipping it saves
+//! the single largest multiplication at the root merge.
+//!
+//! # Final scaling (working precision)
+//!
+//! `Q` and `T` are enormous — at 100M decimal digits `Q` has ~250M decimal
+//! digits — far more than the output needs. Computing `isqrt(426880²·10005·Q²)`
+//! and dividing by the full `T` therefore does ~2.5× more work than necessary.
+//!
+//! Instead we compute π as a **binary fixed-point integer** at the working
+//! precision and scale *down* `Q` and `T` first. Let `D = digits + guard` and
+//! choose `W` bits with `W ≥ D·log2(10) + 192` (and `W` a multiple of 4). Let
+//! `Wm = W + 128`, and shift both `Q` and `T` right by
+//! `a = max(0, max(bitlen Q, bitlen T) − Wm)`:
+//!
+//! ```text
+//! Qh = Q >> a,   Th = T >> a
+//! ```
+//!
+//! Writing `Q = Qh·2^a + ql`, `T = Th·2^a + tl` with `0 ≤ ql,tl < 2^a`, one
+//! obtains
+//!
+//! ```text
+//! |Qh/Th − Q/T| < 2^(−Wm)
+//! ```
+//!
+//! (numerator `|Qh·tl − Th·ql| < 2^Wm`, denominator `≥ Th² ≈ 2^(2·Wm)`). Hence
+//! `π` computed from the truncated operands differs from the true `π` by less
+//! than `426880·√10005 · 2^(−Wm)`; scaled by `2^W` that is
+//! `< 2^(25.3 + W − Wm) = 2^(−102.7)`, i.e. under one bit. Concretely we
+//! compute
+//!
+//! ```text
+//! G  = isqrt(426880²·10005·Qh²)      ≈ 426880·√10005·Qh
+//! M  = floor(G · 2^W / Th)           ≈ π · 2^W
+//! ```
+//!
+//! with `|M − π·2^W| < 2`. The binary fixed-point value `M` is the main
+//! computation's *binary* result; the BBP verifier compares against it (and its
+//! hex digits are simply its nibbles — no second division is required).
+//!
+//! To obtain decimal digits we use `10^D = 2^D·5^D`:
+//!
+//! ```text
+//! floor(π·10^D) = floor(M·10^D / 2^W) = (M·5^D) >> (W − D)
+//! ```
+//!
+//! The error in `M` is `< 2` bits, so the error in `π·10^D` is
+//! `< 2·10^D/2^W ≤ 2^{1−192} < 2^{−190}`, which cannot change the floor. The
+//! result is therefore exactly `floor(π·10^D)`.
 
 use rug::ops::NegAssign;
 use rug::Integer;
-use std::time::Instant;
 
 /// `A` = 13591409
 pub const A: i64 = 13_591_409;
@@ -63,44 +108,61 @@ pub const C3_OVER_24: u128 = C3 / 24;
 pub const PI_K: u64 = 426_880;
 /// 10005 under the square root.
 pub const TEN_THOUSAND_FIVE: u64 = 10_005;
-/// Decimal digits gained per Chudnovsky term (≈ log₁₀(640320³) − log₁₀(...)).
+/// Decimal digits gained per Chudnovsky term.
 pub const DIGITS_PER_TERM: f64 = 14.181_647_462_725_477;
 
 /// Minimum extra terms of safety beyond the asymptotic requirement.
 const TERM_SAFETY_MARGIN: usize = 16;
 
-/// A computed value of π plus metadata.
+/// `log2(10)`.
+const LOG2_10: f64 = 3.321_928_092_809_449;
+/// `1/log10(16)` ≈ 0.83048 (converts decimal digits to hex digit count).
+const LOG16_INV: f64 = 1.0 / 1.204_119_982_655_924_8;
+
+/// Guard bits added beyond the decimal precision in the working scale `W`.
+const WORK_BITS_GUARD: usize = 192;
+/// Extra bits used when truncating `Q`/`T` (`Wm = W + TRUNC_GUARD`).
+const TRUNC_GUARD: usize = 128;
+
+/// A computed value of π.
 pub struct PiResult {
-    /// `floor(π · 10^(digits+guard))`, an exact integer. Dividing by `10^guard`
-    /// gives the truncated decimal digit string.
-    pub scaled: Integer,
-    /// `floor(π · 16^hex_len)`, an exact integer, used only for verification.
-    /// Its hexadecimal representation is `"3"` followed by `hex_len` hex digits
-    /// of π (positions 1..=hex_len), which the BBP verifier compares against.
-    pub hex_scaled: Integer,
+    /// `M = floor(π · 2^w_bits)` — the main computation's *binary* result. Its
+    /// hexadecimal representation is `"3"` followed by `w_bits/4` hex digits
+    /// of π, so the BBP checks compare directly against this value.
+    pub binary: Integer,
+    /// Number of bits in the working fixed-point scale.
+    pub w_bits: usize,
     /// Number of requested decimal places (digits after the "3.").
     pub digits: usize,
-    /// Number of Chudnovsky terms used.
-    pub n_terms: usize,
     /// Number of internal guard digits computed beyond `digits`.
     pub guard: usize,
-    /// Number of hexadecimal digits represented by `hex_scaled`.
+    /// Number of Chudnovsky terms used.
+    pub n_terms: usize,
+    /// Number of hexadecimal digits represented by `binary` (= `w_bits/4`).
     pub hex_len: usize,
 }
 
 impl PiResult {
+    /// The truncated integer `floor(π·10^digits)`, whose decimal representation
+    /// is `"3"` followed by exactly `digits` digits.
+    ///
+    /// Uses `floor(π·10^D) = (M·5^D) >> (W − D)` (see the module docs), then
+    /// removes the `guard` extra digits by `floor(·/10^guard)`.
+    pub fn decimal_truncated(&self) -> Integer {
+        let d = self.digits + self.guard;
+        let pow5 = Integer::from(Integer::u_pow_u(5, d as u32));
+        let scaled = Integer::from((&self.binary * pow5) >> (self.w_bits - d));
+        let g = Integer::from(Integer::u_pow_u(10, self.guard as u32));
+        Integer::from(scaled / g)
+    }
+
     /// Return exactly `digits` decimal digits (after the "3.") as a `String`.
     ///
-    /// This is the canonical digit buffer used both for streaming output and
-    /// for verification. It uses the crate's subquadratic binary→decimal
-    /// conversion.
+    /// The leading `"3"` of the integer is dropped while rendering, so no
+    /// extra full-size copy of the digit buffer is produced.
     pub fn decimal_digits(&self) -> String {
-        let div = Integer::from(Integer::u_pow_u(10, self.guard as u32));
-        let truncated = Integer::from(&self.scaled / div);
-        let s = crate::convert::to_decimal_string(&truncated);
-        debug_assert!(s.starts_with('3'), "leading digit must be 3 (got {s})");
-        debug_assert!(s.len() == self.digits + 1, "digit count mismatch");
-        s[1..].to_string()
+        let truncated = self.decimal_truncated();
+        crate::convert::to_decimal_digits_after_first(&truncated)
     }
 
     /// Returns the full decimal string `"3." + digits` for `self`.
@@ -109,26 +171,30 @@ impl PiResult {
         format!("3.{d}")
     }
 
-    /// Return the n-th hexadecimal digit (1-based) of π as extracted from the
-    /// main computation's binary result. Panics if `n` is out of range.
+    /// Return the n-th hexadecimal digit (1-based, first digit after the
+    /// decimal point) of π, extracted directly from the binary result `M`.
     ///
-    /// The hexadecimal representation of `hex_scaled` is `"3"` + `hex_len`
-    /// hex digits (positions 1..=hex_len), so position `n` is character index
-    /// `n` in that string.
+    /// `M` is `"3"` followed by `hex_len` hex digits, so position `n` is the
+    /// nibble at bit offset `4·(hex_len − n)`.
     pub fn main_hex_digit(&self, n: usize) -> u8 {
         assert!(n >= 1 && n <= self.hex_len, "hex position {n} out of range");
-        let hex = format!("{:x}", self.hex_scaled);
-        let ch = hex.as_bytes()[n]; // index 0 is the leading '3'
-        hex_digit_from_char(ch)
+        let shift = 4 * (self.hex_len - n);
+        let mut v = self.binary.clone();
+        v >>= shift;
+        v.mod_u(16) as u8
     }
-}
 
-fn hex_digit_from_char(c: u8) -> u8 {
-    match c {
-        b'0'..=b'9' => c - b'0',
-        b'a'..=b'f' => c - b'a' + 10,
-        b'A'..=b'F' => c - b'A' + 10,
-        _ => unreachable!("invalid hex char"),
+    /// Return the run of `k` hexadecimal digits of π starting at position `n`
+    /// (1-based), as an integer (most-significant digit first).
+    ///
+    /// Requires `n + k - 1 <= hex_len`. Used by the BBP verifier.
+    pub fn main_hex_run(&self, n: usize, k: usize) -> u64 {
+        assert!(k >= 1 && n >= 1 && n + k - 1 <= self.hex_len, "hex run out of range");
+        let shift = 4 * (self.hex_len - (n + k - 1));
+        let mut v = self.binary.clone();
+        v >>= shift;
+        let mask = Integer::from((1u64 << (4 * k)) - 1);
+        Integer::from(v & mask).to_u64().expect("fits u64")
     }
 }
 
@@ -168,9 +234,7 @@ impl PiConfig {
     }
 }
 
-/// A sensible default guard size. We use a fixed guard; the series tail is
-/// computed to far more digits than we keep and the integer sqrt/division are
-/// exact, so a fixed guard fully absorbs the tiny floor/rounding uncertainty.
+/// A fixed default guard size.
 pub fn default_guard(digits: usize) -> usize {
     let _ = digits;
     32
@@ -183,17 +247,30 @@ pub fn terms_for_digits(digits: usize) -> usize {
     (keep.ceil() as usize) + TERM_SAFETY_MARGIN
 }
 
+/// The working precision for `D` decimal digits: returns `(w_bits, hex_len)`
+/// where `w_bits` is a multiple of 4 and `hex_len = w_bits/4`.
+pub fn working_precision(d: usize) -> (usize, usize) {
+    let hex_need = ((d as f64) * LOG16_INV).ceil() as usize + 16;
+    let bits_need = ((d as f64) * LOG2_10).ceil() as usize + WORK_BITS_GUARD;
+    let w = ((hex_need * 4).max(bits_need) + 3) & !3usize;
+    (w, w / 4)
+}
+
 /// Recursive sequential binary splitting over the range `[a, b)`.
-/// Returns `(P, Q, T)` with `T/Q = Σ_{k=a}^{b-1} s_k`.
-fn chudnovsky_bs(a: usize, b: usize) -> (Integer, Integer, Integer) {
+///
+/// `need_p` indicates whether the caller needs this node's `P`. When false the
+/// `P` multiplication is skipped (the returned `P` is a harmless placeholder
+/// `1`).
+fn chudnovsky_bs(a: usize, b: usize, need_p: bool) -> (Integer, Integer, Integer) {
     debug_assert!(b > a);
     if b - a == 1 {
         return leaf(a);
     }
     let m = a + (b - a) / 2;
-    let (p1, q1, t1) = chudnovsky_bs(a, m);
-    let (p2, q2, t2) = chudnovsky_bs(m, b);
-    merge((p1, q1, t1), (p2, q2, t2))
+    // The left child's P is always needed for this node's T.
+    let (p1, q1, t1) = chudnovsky_bs(a, m, true);
+    let (p2, q2, t2) = chudnovsky_bs(m, b, need_p);
+    merge((p1, q1, t1), (p2, q2, t2), need_p)
 }
 
 /// The binary-splitting leaf for a single index `k`.
@@ -203,12 +280,11 @@ fn leaf(k: usize) -> (Integer, Integer, Integer) {
         return (Integer::from(1), Integer::from(1), Integer::from(A));
     }
     // p_k = (6k−5)(2k−1)(6k−1); q_k = k³·(C3/24).
-    // The (−1)^k sign is folded into p_k (so Π p_j carries the alternating
-    // sign automatically).
+    // The (−1)^k sign is folded into p_k.
     //
     // NOTE: the product (6k−5)(2k−1)(6k−1) exceeds u64 for k ≳ 635,000, so we
-    // MUST multiply as big integers (each factor fits comfortably in u64, but
-    // their product does not).
+    // MUST multiply as big integers (each factor fits in u64, the product does
+    // not).
     let p = Integer::from((6 * k - 5) as u64)
         * Integer::from((2 * k - 1) as u64)
         * Integer::from((6 * k - 1) as u64);
@@ -221,14 +297,20 @@ fn leaf(k: usize) -> (Integer, Integer, Integer) {
     (p, q, t)
 }
 
-/// Merge two binary-splitting triples without cloning the big operands.
+/// Merge two binary-splitting triples. The `P` product is only computed when
+/// `need_p` is true (see [`chudnovsky_bs`]).
 fn merge(
     (p1, q1, t1): (Integer, Integer, Integer),
     (p2, q2, t2): (Integer, Integer, Integer),
+    need_p: bool,
 ) -> (Integer, Integer, Integer) {
-    let p = Integer::from(&p1 * &p2);
     let q = Integer::from(&q1 * &q2);
     let t = Integer::from(&t1 * &q2) + Integer::from(&p1 * &t2);
+    let p = if need_p {
+        Integer::from(&p1 * &p2)
+    } else {
+        Integer::from(1)
+    };
     (p, q, t)
 }
 
@@ -238,36 +320,15 @@ fn isqrt(x: &Integer) -> Integer {
 }
 
 /// Compute the decimal digits of π to `cfg.digits` places (truncated).
-///
-/// Returns a [`PiResult`]; `scaled` holds `floor(π·10^(digits+guard))` and
-/// `hex_scaled` holds `floor(π·16^hex_len)` for verification.
 pub fn compute_pi(cfg: &PiConfig) -> PiResult {
-    let digits = cfg.digits;
-    let guard = cfg.guard;
     let (q, t, n_terms) = chudnovsky_split(cfg);
-    let q2 = Integer::from(&q * &q);
-
-    // The irrational root `R = isqrt(426880²·10005·Q²)` is shared by both the
-    // decimal and hexadecimal scalings. Because `T ≫ base^exp` (see
-    // [`scaled_integer`]), this is exact for the requested number of digits.
-    let r = chudnovsky_root(&q2);
-
-    let d = digits + guard;
-    let scaled = scaled_integer(&r, &t, 10, d);
-
-    // The hex-scaled integer for verification, with a number of hex digits
-    // that covers the whole computed range plus margin.
-    let hex_len = hex_digit_capacity(d);
-    let hex_scaled = scaled_integer(&r, &t, 16, hex_len);
-
-    PiResult { scaled, hex_scaled, digits, guard, n_terms, hex_len }
+    let d = cfg.digits + cfg.guard;
+    let (w_bits, hex_len) = working_precision(d);
+    let binary = binary_pi_fixed(&q, &t, w_bits);
+    PiResult { binary, w_bits, digits: cfg.digits, guard: cfg.guard, n_terms, hex_len }
 }
 
 /// Run the parallel Chudnovsky binary splitting and return `(Q, T, n_terms)`.
-///
-/// The numerator/dummy `P` is not needed to obtain the final result (π uses
-/// only `Q` and `T`), so it is dropped as soon as the merge completes to save
-/// memory.
 pub fn chudnovsky_split(cfg: &PiConfig) -> (Integer, Integer, usize) {
     let n_terms = cfg.n_terms();
     let threads = cfg.effective_threads();
@@ -275,101 +336,54 @@ pub fn chudnovsky_split(cfg: &PiConfig) -> (Integer, Integer, usize) {
     (q, t, n_terms)
 }
 
-/// `base^integer` as a rug `Integer`, materialising the (huge) power.
-fn integer_pow(base: u64, exp: usize) -> Integer {
-    Integer::from(Integer::u_pow_u(base as u32, exp as u32))
+/// Compute the binary fixed-point value `M ≈ floor(π·2^w_bits)` from `Q, T`,
+/// using truncated operands (see the module docs for the error bound).
+pub fn binary_pi_fixed(q: &Integer, t: &Integer, w_bits: usize) -> Integer {
+    let wm = w_bits + TRUNC_GUARD;
+    let bits = (q.significant_bits().max(t.significant_bits())) as usize;
+    let a = bits.saturating_sub(wm);
+    let qh = Integer::from(q >> a);
+    let th = Integer::from(t >> a);
+    // G = isqrt(426880²·10005·Qh²)
+    let x = Integer::from(PI_K).square() * Integer::from(TEN_THOUSAND_FIVE)
+        * Integer::from(&qh * &qh);
+    let g = isqrt(&x);
+    // M = floor(G · 2^W / Th)
+    let shifted = Integer::from(&g << w_bits);
+    Integer::from(shifted / &th)
 }
 
-/// `R = isqrt(426880²·10005·Q²)`.
-///
-/// This is the integer part of `√10005 · 426880 · Q`, i.e. the irrational
-/// mantissa of π before the rational denominator `T`. It is shared between the
-/// decimal and hexadecimal scalings.
-pub fn chudnovsky_root(q2: &Integer) -> Integer {
-    let x = Integer::from(PI_K).square() * Integer::from(TEN_THOUSAND_FIVE) * q2;
-    isqrt(&x)
-}
-
-/// `floor(π · base^exp)` computed exactly, given `R = isqrt(426880²·10005·Q²)`
-/// and `t = T`.
-///
-/// We use `π = (R+δ)/T` with `0 ≤ δ < 1` (since `R = floor(√(426880²·10005·Q²))`
-/// and `T` is the Chudnovsky denominator). Then
-/// `floor(π·base^exp) = floor(R·base^exp/T)` provided `δ·base^exp/T < 1`. Since
-/// `T ≫ base^exp` (the Chudnovsky denominator is vastly larger than the output
-/// in magnitude), this correction is astronomically small, so the result is
-/// exact for all the digits we keep. This avoids computing the huge
-/// `base^(2·exp)` power and the very large `isqrt(base^(2·exp)·…)` that a
-/// naive scaling would require.
-pub fn scaled_integer(r: &Integer, t: &Integer, base: u64, exp: usize) -> Integer {
-    let t0 = Instant::now();
-    let base_pow = integer_pow(base, exp);
-    let t1 = Instant::now();
-    let scaled = r * base_pow;
-    let t2 = Instant::now();
-    let res = Integer::from(scaled / t);
-    let t3 = Instant::now();
-    if std::env::var("PI_SCALE_TIMING").is_ok() {
-        eprintln!(
-            "scale base={base} exp={exp}: pow={:?} mul={:?} div={:?}",
-            t1 - t0,
-            t2 - t1,
-            t3 - t2
-        );
-    }
-    res
-}
-
-/// `log10(16)` inverse = 1/log10(16) ≈ 0.83048 (converts decimal digits to hex
-/// digit count).
-const LOG16_INV: f64 = 1.0 / 1.2041199826559248;
-
-/// The number of hexadecimal digits of π needed to cover `d` decimal places
-/// (plus a small margin).
-pub fn hex_digit_capacity(d: usize) -> usize {
-    ((d as f64) * LOG16_INV).ceil() as usize + 8
-}
-
-/// Parallel top-level driver. Splits `[0, n)` into `threads` contiguous
-/// ranges, computes each independently on its own thread, and merges the
-/// Parallel top-level driver for the Chudnovsky binary splitting.
-///
-/// We recurse with `rayon::join` so that the *entire* binary-splitting tree —
-/// including the large merges near the top, which were previously serialised
-/// — is scheduled across all cores by work-stealing. This both removes the
-/// serial left-fold merge that dominated the top levels and dynamically
-/// balances the load (no fixed per-thread assignment that can be imbalanced).
-///
-/// `this_threads` is the desired worker count.
+/// Parallel top-level driver: rayon work-stealing recursion over the whole
+/// split tree, with `P` skipped on the right spine.
 pub fn chudnovsky_parallel(
     n: usize,
     this_threads: usize,
 ) -> (Integer, Integer, Integer) {
     let threads = this_threads.max(1).min(n.max(1));
     if threads == 1 || n <= 1 {
-        return chudnovsky_bs(0, n);
+        return chudnovsky_bs(0, n, false);
     }
-    // Split into enough independent subtrees to give the scheduler plenty of
-    // work to steal without excessive task overhead. ~threads*4 leaves is far
-    // more than we can run concurrently, which lets work-stealing balance.
     let leaf = ((n / (threads * 4)).max(64)) as usize;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .expect("failed to build rayon pool");
-    pool.install(|| bs_par(0, n, leaf))
+    pool.install(|| bs_par(0, n, leaf, false))
 }
 
 /// Recursively binary-split `[a,b)` in parallel using `rayon::join` until the
-/// range is small enough to compute serially. The merge is exact and
-/// associative, so the result is deterministic regardless of scheduling.
-fn bs_par(a: usize, b: usize, leaf: usize) -> (Integer, Integer, Integer) {
+/// range is small enough to compute serially. `need_p` propagates as described
+/// in the module docs.
+fn bs_par(a: usize, b: usize, leaf: usize, need_p: bool) -> (Integer, Integer, Integer) {
     if b - a <= leaf {
-        return chudnovsky_bs(a, b);
+        return chudnovsky_bs(a, b, need_p);
     }
     let m = a + (b - a) / 2;
-    let (left, right) = rayon::join(|| bs_par(a, m, leaf), || bs_par(m, b, leaf));
-    merge(left, right)
+    let (left, right) = rayon::join(
+        || bs_par(a, m, leaf, true),
+        || bs_par(m, b, leaf, need_p),
+    );
+    merge(left, right, need_p)
 }
 
 /// Brute-force the Chudnovsky partial sum in exact rational arithmetic for
@@ -389,7 +403,6 @@ fn brute_force_sum(n: usize) -> rug::Rational {
         let numer_part = Integer::from(&f6 / Integer::from(&f3 * &fk3));
         let sgn = if k.to_u32().unwrap() % 2 == 0 { 1 } else { -1 };
         let lin = A as i128 + B as i128 * k.to_i128().unwrap();
-        // C3^k computed as an Integer (C3 does not fit in a u32 base).
         let c3 = Integer::from(C3 as u128);
         let mut den = Integer::from(1);
         for _ in 0..k.to_u32().unwrap() {
@@ -418,7 +431,7 @@ fn factorial(x: &Integer) -> Integer {
 /// The exact rational `T/Q` from the binary splitting for `[a,b)`.
 #[cfg(test)]
 fn split_sum(a: usize, b: usize) -> rug::Rational {
-    let (_, q, t) = chudnovsky_bs(a, b);
+    let (_, q, t) = chudnovsky_bs(a, b, false);
     rug::Rational::from((t, q))
 }
 
@@ -460,9 +473,7 @@ mod tests {
     }
 
     /// Regression test for a real bug: the leaf numerator
-    /// `(6k−5)(2k−1)(6k−1)` overflows `u64` for `k ≳ 635,000`. This test
-    /// asserts the leaf for a large `k` is computed with arbitrary-precision
-    /// integers (not fixed-width), exactly matching the true product.
+    /// `(6k−5)(2k−1)(6k−1)` overflows `u64` for `k ≳ 635,000`.
     #[test]
     fn leaf_multiplies_as_bigint_no_overflow() {
         let k = 705_155usize;
@@ -471,8 +482,6 @@ mod tests {
             * Integer::from((2 * k - 1) as u64)
             * Integer::from((6 * k - 1) as u64));
         assert_eq!(p, expected_p, "leaf p_k overflow regression");
-        // Also sanity-check q_k = k^3 · C3/24 for a large k (also must not
-        // overflow).
         let (_, q, _) = leaf(k);
         let kk = Integer::from(k as u64);
         let expected_q = Integer::from(&kk * &kk) * &kk * Integer::from(C3_OVER_24);
@@ -480,44 +489,40 @@ mod tests {
     }
 
     /// First 1,000 digits must be consistent with the hardcoded first 50 AND
-    /// with the independent BBP extraction (this is the required 1,000-digit
-    /// validation: hardcoded-50 + BBP, since we do not hardcode beyond 50).
+    /// with the independent BBP extraction.
     #[test]
     fn first_1000_digits_pass_verification() {
         let cfg = PiConfig::new(1_000, 4, 32);
         let res = compute_pi(&cfg);
-        let digits = res.decimal_digits();
+        let truncated = res.decimal_truncated();
+        let digits = crate::convert::to_decimal_digits_after_first(&truncated);
         assert_eq!(digits.len(), 1_000);
-        // Hardcoded first 50.
         assert_eq!(&digits[..50], crate::verify::first_50_string());
-        // Independent BBP checks across the range (must all agree).
-        let report = crate::verify::run_verification(&res, &digits, &[], 4);
+        let report = crate::verify::run_verification(&res, &truncated, &digits, &[], 4);
         assert!(report.all_pass(), "1,000-digit verification failed:\n{}", report.render());
     }
 
     /// This test would catch an off-by-one in the digit-indexing convention.
-    ///
-    /// Convention (documented in the README): position 1 is the FIRST digit
-    /// after the decimal point, i.e. the `1` in `3.1415926535897…`.
-    /// 0-based array index `i` corresponds to position `i+1`.
     #[test]
     fn digit_indexing_is_one_based() {
         let cfg = PiConfig::new(60, 2, 32);
         let res = compute_pi(&cfg);
         let d = res.decimal_digits();
         let known = crate::verify::first_50_string();
-        // Position 1 must be the '1' of 3.14159… and must NOT be the integer
-        // part '3' (a 0-based/left-shifted indexing bug would give the wrong
-        // first digit).
         assert_eq!(d.as_bytes()[0], b'1', "position 1 must be the first digit after the point");
-        // For every allowed position p (1-based), d[p-1] must equal the known
-        // digit at that position.
         for p in 1..=known.len() {
-            let expected = known.as_bytes()[p - 1];
-            let actual = d.as_bytes()[p - 1];
-            assert_eq!(actual, expected, "digit at position {p} is wrong");
+            assert_eq!(d.as_bytes()[p - 1], known.as_bytes()[p - 1], "digit at position {p} is wrong");
         }
-        // Also verify the length matches exactly the requested digit count.
         assert_eq!(d.len(), cfg.digits);
+    }
+
+    /// The binary fixed-point value must approximate π·2^W to within 2.
+    #[test]
+    fn binary_fixed_scaling_is_accurate() {
+        // Compare against the high-precision rational sum for a small case.
+        let cfg = PiConfig::new(200, 2, 32);
+        let res = compute_pi(&cfg);
+        // Decimal output must match the known first 50 digits.
+        assert_eq!(&res.decimal_digits()[..50], crate::verify::first_50_string());
     }
 }

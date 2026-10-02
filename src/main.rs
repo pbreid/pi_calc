@@ -1,14 +1,15 @@
 //! Command-line entry point for computing π with the Chudnovsky formula.
 //!
 //! This binary wires together the library modules: it parses the CLI, runs the
-//! (parallel) binary splitting, converts to decimal digits, writes them to a
-//! file in a streaming fashion, and runs the two verification layers.
+//! (parallel) binary splitting, computes the binary fixed-point value of π,
+//! converts it to decimal digits, writes them to a file in a streaming fashion,
+//! and (by default) runs the verification layers.
 
 use clap::Parser;
 use pi::chudnovsky::{self, PiConfig, PiResult};
+use pi::convert;
 use pi::output::DigitWriter;
 use pi::verify;
-use rug::Integer;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -48,8 +49,7 @@ struct Args {
     threads: Option<usize>,
 
     /// Number of guard digits computed internally beyond `--digits`
-    /// (default: a small fixed guard). More guard digits increase confidence
-    /// but cost work.
+    /// (default: a small fixed guard).
     #[arg(long, value_name = "G")]
     guard: Option<usize>,
 
@@ -57,11 +57,9 @@ struct Args {
     #[arg(long, default_value = "pi.txt", value_name = "PATH")]
     output: PathBuf,
 
-    /// Run verification after computation (BBP spot-checks + decimal
-    /// checkpoints). Off by default: `--digits N` just computes and writes the
-    /// digits.
+    /// Skip verification (verification is ON by default).
     #[arg(long)]
-    verify: bool,
+    no_verify: bool,
 
     /// File of externally-sourced decimal checkpoints, one per line:
     /// `<position> <digits>` (e.g. `1000000 1`).
@@ -75,11 +73,12 @@ struct Args {
 
 struct Timings {
     series: std::time::Duration,
-    final_pow: std::time::Duration,
-    hex_pow: std::time::Duration,
+    scale_binary: std::time::Duration,
+    scale_decimal: std::time::Duration,
     conversion: std::time::Duration,
     write: std::time::Duration,
     verify: std::time::Duration,
+    verify_conversion_check: std::time::Duration,
 }
 
 fn main() {
@@ -101,59 +100,38 @@ fn run(args: &Args) -> Result<i32, String> {
     let guard = args.guard.unwrap_or(0);
     let cfg = PiConfig::new(args.digits, threads, guard);
     let d = cfg.digits + cfg.guard;
-    let hex_len = chudnovsky::hex_digit_capacity(d);
-    let verify_on = args.verify || args.checkpoints.is_some();
+    let verify_on = !args.no_verify;
 
     // --- Phase 1: series evaluation (parallel binary splitting) ---
     let t0 = Instant::now();
     let (q, t, n_terms) = chudnovsky::chudnovsky_split(&cfg);
     let t1 = Instant::now();
 
-    // --- Phase 2: final scaling (integer sqrt + division) ---
-    let q2 = Integer::from(&q * &q);
-    // The irrational root R = isqrt(426880²·10005·Q²) is shared by the decimal
-    // and hex scalings (computed once, not twice).
-    let r = chudnovsky::chudnovsky_root(&q2);
-    // The decimal and hex scalings are independent (they share R and T but
-    // scale by different bases), so when verification is needed we run them
-    // concurrently. The hex-scaled integer is only needed for the BBP
-    // verification; skip it entirely when verification is disabled.
-    let (scaled, hex_scaled, used_hex_len, hex_overlapped) = if verify_on {
-        let t_sc = Instant::now();
-        let (s, h) = rayon::join(
-            || chudnovsky::scaled_integer(&r, &t, 10, d),
-            || chudnovsky::scaled_integer(&r, &t, 16, hex_len),
-        );
-        (s, h, hex_len, t_sc.elapsed())
-    } else {
-        let t_sc = Instant::now();
-        let s = chudnovsky::scaled_integer(&r, &t, 10, d);
-        (s, Integer::from(1), 0usize, t_sc.elapsed())
-    };
+    // --- Phase 2: final scaling to a binary fixed-point value M ≈ π·2^W ---
+    let (w_bits, hex_len) = chudnovsky::working_precision(d);
+    let binary = chudnovsky::binary_pi_fixed(&q, &t, w_bits);
     let t2 = Instant::now();
-    // In the concurrent case the hex work is overlapped with the decimal work;
-    // record zero additional hex time so the timings stay truthful (total is
-    // unchanged).
-    let _ = hex_overlapped;
-    let t3 = t2;
 
     let result = PiResult {
-        scaled,
-        hex_scaled,
+        binary,
+        w_bits,
         digits: cfg.digits,
         guard: cfg.guard,
         n_terms,
-        hex_len: used_hex_len,
+        hex_len,
     };
 
-    // --- Phase 3: binary -> decimal base conversion ---
-    let digits = result.decimal_digits();
+    // --- Phase 3: decimal scaling: floor(π·10^digits) as an integer ---
+    let truncated = result.decimal_truncated();
+    let t3 = Instant::now();
+
+    // --- Phase 4: binary -> decimal base conversion ---
+    let digits = convert::to_decimal_digits_after_first(&truncated);
     let t4 = Instant::now();
 
-    // --- Phase 4: streaming file write ---
-    let mut writer = DigitWriter::create(&args.output).map_err(|e| {
-        format!("cannot open output file {}: {e}", args.output.display())
-    })?;
+    // --- Phase 5: streaming file write ---
+    let mut writer = DigitWriter::create(&args.output)
+        .map_err(|e| format!("cannot open output file {}: {e}", args.output.display()))?;
     writer
         .write_prefix()
         .and_then(|_| writer.write_digits(digits.as_bytes()))
@@ -163,15 +141,12 @@ fn run(args: &Args) -> Result<i32, String> {
         .map_err(|e| format!("error flushing output file {}: {e}", args.output.display()))?;
     let t5 = Instant::now();
     if written != 2 + cfg.digits {
-        return Err(format!(
-            "wrote {} bytes, expected {}",
-            written,
-            2 + cfg.digits
-        ));
+        return Err(format!("wrote {} bytes, expected {}", written, 2 + cfg.digits));
     }
 
-    // --- Phase 5: verification ---
+    // --- Phase 6: verification ---
     let mut report = verify::VerifyReport::default();
+    let mut conv_check = std::time::Duration::ZERO;
     if verify_on {
         let checkpoints = match &args.checkpoints {
             Some(path) => {
@@ -181,7 +156,17 @@ fn run(args: &Args) -> Result<i32, String> {
             }
             None => Vec::new(),
         };
-        report = verify::run_verification(&result, &digits, &checkpoints, threads);
+        for c in verify::verify_bbp(&result, threads) {
+            report.push(c);
+        }
+        let tc = Instant::now();
+        for c in verify::verify_conversion(&truncated, &digits, threads) {
+            report.push(c);
+        }
+        conv_check = tc.elapsed();
+        for c in verify::verify_decimal(&digits, &checkpoints) {
+            report.push(c);
+        }
     }
     let t6 = Instant::now();
 
@@ -189,11 +174,12 @@ fn run(args: &Args) -> Result<i32, String> {
     if args.bench {
         let timings = Timings {
             series: t1 - t0,
-            final_pow: t2 - t1,
-            hex_pow: t3 - t2,
+            scale_binary: t2 - t1,
+            scale_decimal: t3 - t2,
             conversion: t4 - t3,
             write: t5 - t4,
             verify: t6 - t5,
+            verify_conversion_check: conv_check,
         };
         print_bench(&cfg, &timings, verify_on);
     }
@@ -207,14 +193,13 @@ fn run(args: &Args) -> Result<i32, String> {
     );
 
     if verify_on {
-        let text = report.render();
-        eprint!("{text}");
-        if report.all_pass() {
-            eprintln!("verification: ALL CHECKS PASSED");
-            Ok(0)
-        } else {
+        eprint!("{}", report.render());
+        if report.has_failure() {
             eprintln!("verification: FAILURES DETECTED");
             Ok(1)
+        } else {
+            eprintln!("verification: NO FAILURES");
+            Ok(0)
         }
     } else {
         Ok(0)
@@ -223,7 +208,7 @@ fn run(args: &Args) -> Result<i32, String> {
 
 fn print_bench(cfg: &PiConfig, t: &Timings, verify_on: bool) {
     let total: std::time::Duration =
-        [t.series, t.final_pow, t.hex_pow, t.conversion, t.write]
+        [t.series, t.scale_binary, t.scale_decimal, t.conversion, t.write]
             .iter()
             .copied()
             .sum::<std::time::Duration>()
@@ -232,16 +217,14 @@ fn print_bench(cfg: &PiConfig, t: &Timings, verify_on: bool) {
     eprintln!("digits:                    {}", cfg.digits);
     eprintln!("threads:                   {}", cfg.effective_threads());
     eprintln!("Chudnovsky series (BS):    {:>10.3?}", t.series);
-    eprintln!("final scaling (decimal):   {:>10.3?}", t.final_pow);
-    eprintln!("final scaling (hex/verify):{:>10.3?}", t.hex_pow);
+    eprintln!("scaling (binary sqrt/div): {:>10.3?}", t.scale_binary);
+    eprintln!("decimal scaling (10^D):    {:>10.3?}", t.scale_decimal);
     eprintln!("base conversion (10):      {:>10.3?}", t.conversion);
     eprintln!("file write:                {:>10.3?}", t.write);
     if verify_on {
         eprintln!("verification:              {:>10.3?}", t.verify);
+        eprintln!("  └ conversion check:      {:>10.3?}", t.verify_conversion_check);
     }
     eprintln!("total (compute+write):     {:>10.3?}", total);
-    eprintln!("peak memory (VmHWM):       {}", {
-        let kb = peak_mem_kb();
-        fmt_mb(kb)
-    });
+    eprintln!("peak memory (VmHWM):       {}", fmt_mb(peak_mem_kb()));
 }

@@ -1,8 +1,8 @@
 //! Bailey–Borwein–Plouffe (BBP) hexadecimal digit extraction of π.
 //!
-//! The BBP formula expresses π in base 16 in a way that lets one compute a
-//! *single* hexadecimal digit at an arbitrary position without computing any
-//! preceding digits:
+//! The BBP formula expresses π in base 16 in a way that lets one compute
+//! hexadecimal digits at an arbitrary position without computing any preceding
+//! digits:
 //!
 //! ```text
 //! π = Σ_{k=0}^∞ (1/16^k) · [ 4/(8k+1) − 2/(8k+4) − 1/(8k+5) − 1/(8k+6) ]
@@ -17,9 +17,9 @@
 //!
 //! # Algorithm
 //!
-//! The `n`-th hex digit is `floor(16 · frac(16^{n-1} · π))`. We compute
-//! `frac(16^{n-1}·π)` by splitting the BBP series into an integer part and a
-//! fractional part:
+//! The digits starting at position `n` are `floor(16^k · frac(16^{n-1}·π))` for
+//! a run of `k` digits. We compute `frac(16^{n-1}·π)` by splitting the BBP
+//! series into an integer part and a fractional part:
 //!
 //! ```text
 //! frac(16^{n-1} π) = frac( Σ_j c_j · S_j )
@@ -32,53 +32,111 @@
 //!       + Σ_{k=n}^{∞} 1 / (16^{k-n+1} · (8k+j))
 //! ```
 //!
-//! The first sum (with `16^{n-1-k}` an integer) is handled by modular
-//! exponentiation, keeping only the fractional contribution; the second sum is
-//! a rapidly-converging tail approximated by a handful of terms. We work in
-//! double precision, which is sufficient because the BBP digit extraction
-//! needs only ~1/(16·8k) accuracy and the errors do not accumulate. (See the
-//! note in [`hex_digit_checked`].)
+//! The first sum is handled by modular exponentiation, keeping only the
+//! fractional contribution; the second sum is a rapidly-converging tail
+//! approximated by a handful of terms.
 //!
-//! The sum over `k` is embarrassingly parallel and is distributed across all
-//! available threads with `rayon`.
+//! # Precision
+//!
+//! The sum is accumulated in `f64`. Each term is `(t/m)` with `t,m` exact
+//! `f64` values below `2^32` (the modulus is `8k+j`), so each division
+//! contributes at most `0.5 ulp ≈ 2^-53` of absolute error. After reducing mod
+//! 1 the partial sums stay in `[0,1)`. The accumulated error behaves like a
+//! random walk in the rounding directions, i.e. `≈ √(4n)·2^-53`; we multiply
+//! that by a generous safety factor (see [`frac_error_bound`]). The error is
+//! **not** allowed to silently decide a digit: any run whose value lies within
+//! the error bound of a digit boundary is reported `INCONCLUSIVE` by the
+//! verifier rather than PASS/FAIL. This is why we compare a run of digits (the
+//! run is only trusted when its value is far enough from a boundary), and why
+//! the run length is capped at [`MAX_RUN`] hex digits.
+//!
+//! # Overflow
+//!
+//! The modular-exponentiation intermediates `result·base` and `base·base` are
+//! computed in `u128`. With the modulus up to `8k+6` this matters once
+//! `8k+6 ≳ 2^32` (≈650M decimal digits); a `u64` intermediate would overflow
+//! there (the same class of bug as the old leaf overflow).
 
 use rayon::prelude::*;
 
-/// Modular exponentiation `base^exp mod m`, computed with u64 arithmetic
-/// (safe because the modulus, `8k+j`, is small compared to 2^64).
-fn modpow(mut base: u64, mut exp: usize, m: u64) -> u64 {
+/// The maximum number of hexadecimal digits compared per BBP position.
+pub const MAX_RUN: usize = 8;
+
+/// Modular exponentiation `base^exp mod m`.
+///
+/// The products are formed in `u128` so the routine is correct for moduli up
+/// to (and beyond) `2^32`; with `u64` products it would overflow once the
+/// modulus exceeds ≈`2^32`.
+pub fn modpow(mut base: u64, mut exp: usize, m: u64) -> u64 {
     debug_assert!(m > 0);
     let mut result = 1u64 % m;
     base %= m;
+    let m128 = m as u128;
     while exp > 0 {
         if exp & 1 == 1 {
-            result = (result * base) % m;
+            result = ((result as u128 * base as u128) % m128) as u64;
         }
-        base = (base * base) % m;
+        base = ((base as u128 * base as u128) % m128) as u64;
         exp >>= 1;
     }
     result
 }
 
-/// The fractional part of `16^{n-1} · π`, i.e. `frac(16^{n-1} π)`, in `[0,1)`.
+/// A conservative bound on the absolute error of the double-precision BBP
+/// fractional sum for position `n`.
 ///
-/// `threads` controls how many threads are used for the inner k-sum (0 = all
-/// cores). Computed in double precision.
+/// Each of the `≈4n` term divisions contributes at most `2^-53`; the rounding
+/// directions are effectively random, so the total grows like
+/// `√(4n)·2^-53`. We apply a safety factor of 16. Calibration (see
+/// `examples/bbp_prec.rs`, which compares against a 256-bit computation): at
+/// `n ≈ 8.3M` the measured error was `2.3e-13`, while this bound gives
+/// `2.0e-11` (~90×); at `n ≈ 83M` it gives `6.5e-11` (~90× the expected
+/// error). The verifier never decides a digit that lies within this bound
+/// (such runs are `INCONCLUSIVE`).
+pub fn frac_error_bound(n: usize) -> f64 {
+    let rw = (4.0 * n as f64).sqrt() * f64::EPSILON * 16.0;
+    rw.max(1e-12)
+}
+
+/// The fractional part `frac(16^{n-1}·π)` in `[0,1)`, computed in `f64`.
+///
+/// `threads` controls the inner k-sum (0 = all cores).
 pub fn bbp_fractional(n: usize, threads: usize) -> f64 {
-    let (_digits, fr) = bbp_digit_precise(n, threads);
-    fr
+    compute_frac(n, threads)
 }
 
-/// Compute the `n`-th hexadecimal digit of π (1-based) and also return the raw
-/// fractional value, so callers can detect numerical ambiguity.
+/// Compute the run of `k` (`≤ MAX_RUN`) hexadecimal digits of π beginning at
+/// position `n` (1-based).
 ///
-/// Returns `(digit, fractional)`. `digit` is the hex digit value 0..=15;
-/// `fractional = 16·frac(16^{n-1}·π)` (a value in `[0,16)`).
-pub fn hex_digit_checked(n: usize, threads: usize) -> (u8, f64) {
-    bbp_digit_precise(n, threads)
+/// Returns `(run, err, dist)` where `run` is the integer formed by those `k`
+/// hex digits (most significant first), `err` is a bound on the absolute error
+/// of `run` induced by the `f64` accumulation, and `dist` is the distance of
+/// the underlying real value from the nearest digit boundary (also in `run`
+/// units). The run may be trusted iff `dist > err`.
+pub fn hex_run(n: usize, k: usize, threads: usize) -> (u64, f64, f64) {
+    assert!(k >= 1 && k <= MAX_RUN, "run length {k} out of range");
+    let frac = compute_frac(n, threads);
+    let scale = 16f64.powi(k as i32);
+    let v = frac * scale;
+    let floor = v.floor();
+    let run = floor as u64;
+    let frac_part = v - floor;
+    let dist = frac_part.min(1.0 - frac_part);
+    let err = frac_error_bound(n) * scale;
+    (run, err, dist)
 }
 
-fn bbp_digit_precise(n: usize, threads: usize) -> (u8, f64) {
+/// Compute the `n`-th hexadecimal digit of π (1-based) and the raw
+/// `16·frac(16^{n-1}·π)` value (in `[0,16)`), so callers can inspect ambiguity.
+pub fn hex_digit_checked(n: usize, threads: usize) -> (u8, f64) {
+    let frac = compute_frac(n, threads);
+    let frac16 = 16.0 * frac;
+    let digit = (frac16.floor() as i64).clamp(0, 15) as u8;
+    (digit, frac16)
+}
+
+/// Compute `frac(16^{n-1}·π)` in `f64`.
+fn compute_frac(n: usize, threads: usize) -> f64 {
     let pool = build_pool(threads);
     let mut acc = 0.0f64;
     for (j, c) in [(1u64, 4.0f64), (4u64, -2.0f64), (5u64, -1.0f64), (6u64, -1.0f64)] {
@@ -86,15 +144,10 @@ fn bbp_digit_precise(n: usize, threads: usize) -> (u8, f64) {
         acc += c * s;
         acc = acc.rem_euclid(1.0);
     }
-    acc = acc.rem_euclid(1.0);
-    let frac16 = 16.0 * acc;
-    let digit = frac16.floor() as i64;
-    let digit = digit.clamp(0, 15) as u8;
-    (digit, frac16)
+    acc.rem_euclid(1.0)
 }
 
-/// Sum `Σ_{k=0}^{n-1} ((16^{n-1-k} mod (8k+j)) / (8k+j))` plus the tail, in
-/// double precision, using the provided thread pool.
+/// Sum `Σ_{k=0}^{n-1} ((16^{n-1-k} mod (8k+j)) / (8k+j))` plus the tail.
 fn sum_over_k(n: usize, j: u64, pool: &rayon::ThreadPool) -> f64 {
     if n == 0 {
         return tail_sum(0, j);
@@ -110,14 +163,11 @@ fn sum_over_k(n: usize, j: u64, pool: &rayon::ThreadPool) -> f64 {
             })
             .reduce(|| 0.0, |a, b| (a + b).rem_euclid(1.0))
     });
-    // The tail from k = n onward.
     let tail = tail_sum(n, j);
     (s + tail).rem_euclid(1.0)
 }
 
 /// The rapidly converging tail `Σ_{k=n}^{∞} 1/(16^{k-n+1}·(8k+j))`.
-/// Because the terms shrink by a factor of 16 each step, ~18 terms give far
-/// more than double-precision accuracy.
 fn tail_sum(n: usize, j: u64) -> f64 {
     let mut total = 0.0f64;
     let mut p: f64 = 16.0; // 16^{k-n+1} for k=n
@@ -152,6 +202,7 @@ pub fn hex_digit(n: usize) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rug::Integer;
 
     // The known hexadecimal digits of π after the point:
     // π = 3.243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89…
@@ -179,5 +230,38 @@ mod tests {
             assert!(d <= 15, "digit {d} out of range at n={n}");
             assert!((0.0..16.0).contains(&frac), "frac out of range at n={n}: {frac}");
         }
+    }
+
+    /// Regression test for the u64 modpow overflow: the modulus here exceeds
+    /// `2^32`, where `result*base` / `base*base` would overflow a u64.
+    #[test]
+    fn modpow_handles_modulus_above_2_32() {
+        let m: u64 = 5_000_000_007; // > 2^32
+        assert!(m > (1u64 << 32));
+        let cases: [(u64, usize); 4] = [
+            (16, 0),
+            (16, 1),
+            (16, 1_234_567_891),
+            (123_456_789, 987_654_321),
+        ];
+        for (b, e) in cases {
+            let got = modpow(b, e, m);
+            let expect = Integer::from(b)
+                .pow_mod(&Integer::from(e), &Integer::from(m))
+                .unwrap()
+                .to_u64()
+                .unwrap();
+            assert_eq!(got, expect, "modpow({b},{e},{m})");
+        }
+    }
+
+    /// The run length is capped so that the f64 accumulation reliably supports
+    /// it; a boundary run must be detectable.
+    #[test]
+    fn hex_run_is_consistent_with_single_digits() {
+        // Positions from the known prefix: the first 8 hex digits are
+        // 243F6A88.
+        let (run, _err, _dist) = hex_run(1, 8, 2);
+        assert_eq!(run, 0x243F6A88, "8-hex-digit run at position 1");
     }
 }

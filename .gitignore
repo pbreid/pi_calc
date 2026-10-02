@@ -1,2 +1,6 @@
 /target
 /.cargo-home
+# Unrelated scratch directories that appeared in the workspace (not part of
+# this project):
+/crc_work
+/out
