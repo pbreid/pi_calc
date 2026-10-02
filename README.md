@@ -10,7 +10,7 @@ cores, with a **subquadratic** binary→decimal converter, low memory usage, and
    integer, and
 3. externally-sourced decimal checkpoints.
 
-Verification is **on by default**; use `--no-verify` to skip it.
+Verification is **opt-in** via `--verify` (off by default).
 
 It was developed and benchmarked on:
 
@@ -45,7 +45,7 @@ cargo test
 ## Usage
 
 ```
-pi --digits N [--threads T] [--output PATH] [--no-verify]
+pi --digits N [--threads T] [--output PATH] [--verify]
    [--checkpoints PATH] [--bench] [--guard G]
 ```
 
@@ -54,7 +54,7 @@ pi --digits N [--threads T] [--output PATH] [--no-verify]
 | `--digits N` | Number of decimal places after the `"3."` (required). |
 | `--threads T` | Worker threads (default: all logical cores). |
 | `--output PATH` | Output file (default: `pi.txt`). `"3."` followed by exactly N digits, no newlines or spaces. |
-| `--no-verify` | Skip verification (verification is **on by default**). |
+| `--verify` | Run verification (BBP hex checks + modular conversion check + decimal checkpoints). **Off by default** — `--digits N` alone just computes and writes the digits. Supplying `--checkpoints` implies `--verify`. |
 | `--checkpoints PATH` | File of externally-sourced decimal checkpoints, one per line: `<position> <digits>` (e.g. `1000000 1`). |
 | `--bench` | Per-phase timing and peak memory (`VmHWM`). |
 | `--guard G` | Internal guard digits beyond N (default: 32). |
@@ -68,11 +68,14 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 ./target/release/pi --digits 10000000    --output pi_10m.txt  --bench
 ./target/release/pi --digits 100000000   --output pi_100m.txt --bench
 
-# with external decimal checkpoints (verification already on by default)
+# verification: BBP run checks + modular conversion check + decimal checkpoints
+./target/release/pi --digits 1000000 --verify --bench
+
+# providing checkpoints implies verification
 ./target/release/pi --digits 1000000 --checkpoints checkpoints.example.txt --bench
 
-# compute only, no verification
-./target/release/pi --digits 100000000 --no-verify --output pi_100m.txt
+# default: compute only, no verification
+./target/release/pi --digits 100000000 --output pi_100m.txt
 ```
 
 A sample `checkpoints.example.txt`:
@@ -216,7 +219,8 @@ parallelised.
 
 ## Verification design
 
-All three layers run by default after computation.
+All three layers run when `--verify` is given (and are implied by
+`--checkpoints`).
 
 ### A. BBP hexadecimal run checks
 

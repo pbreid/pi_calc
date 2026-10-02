@@ -3,7 +3,7 @@
 //! This binary wires together the library modules: it parses the CLI, runs the
 //! (parallel) binary splitting, computes the binary fixed-point value of π,
 //! converts it to decimal digits, writes them to a file in a streaming fashion,
-//! and (by default) runs the verification layers.
+//! and (when `--verify` is given) runs the verification layers.
 
 use clap::Parser;
 use pi::chudnovsky::{self, PiConfig, PiResult};
@@ -57,9 +57,11 @@ struct Args {
     #[arg(long, default_value = "pi.txt", value_name = "PATH")]
     output: PathBuf,
 
-    /// Skip verification (verification is ON by default).
+    /// Run verification (BBP hex checks + modular conversion check + decimal
+    /// checkpoints). Off by default: `--digits N` just computes and writes the
+    /// digits.
     #[arg(long)]
-    no_verify: bool,
+    verify: bool,
 
     /// File of externally-sourced decimal checkpoints, one per line:
     /// `<position> <digits>` (e.g. `1000000 1`).
@@ -100,7 +102,9 @@ fn run(args: &Args) -> Result<i32, String> {
     let guard = args.guard.unwrap_or(0);
     let cfg = PiConfig::new(args.digits, threads, guard);
     let d = cfg.digits + cfg.guard;
-    let verify_on = !args.no_verify;
+    // Verification is opt-in via `--verify`. Supplying `--checkpoints` also
+    // implies verification (that is the only reason to provide them).
+    let verify_on = args.verify || args.checkpoints.is_some();
 
     // --- Phase 1: series evaluation (parallel binary splitting) ---
     let t0 = Instant::now();

@@ -42,7 +42,7 @@ files (SHA-256 below).
    - C: decimal checkpoints (only the first 50 digits are hardcoded; beyond-range
      checkpoints are SKIPPED).
 5. **CLI** (`src/main.rs`, `clap`): `--digits`, `--threads`, `--output`,
-   `--no-verify` (verification is **on by default**), `--checkpoints`, `--bench`,
+   `--verify` (verification is **off by default**), `--checkpoints`, `--bench`,
    `--guard`.
 6. **Streaming output** (`src/output.rs`).
 7. **Tests**: 22 unit tests + 1 integration test, including the required new
@@ -91,10 +91,9 @@ files (SHA-256 below).
    chosen so `frac_error_bound(n)·16ᵏ ≤ 0.5`); boundary-adjacent runs are
    reported **INCONCLUSIVE** (never PASS/FAIL); positions now include interior
    fractions across the range.
-6. **[MEDIUM] Spec deviations.** Verification is **ON by default** with
-   `--no-verify` to skip (`--verify` removed). Beyond-range checkpoints are
-   **SKIPPED** (1M with `checkpoints.example.txt` exits 0). The always-zero
-   "hex/verify" timing line was removed; real per-phase timings are printed.
+6. **[MEDIUM] Spec deviations.** Beyond-range checkpoints are **SKIPPED** (1M
+   with `checkpoints.example.txt` exits 0). The always-zero "hex/verify" timing
+   line was removed; real per-phase timings are printed.
 7. **[LOW] Memory / efficiency.** The digit buffer is rendered once (no
    `s[1..].to_string()` copy); hex nibbles are extracted directly from `M` (no
    full hex string). Peak memory at 100M: **2.53 GB → 1.67 GB**.
@@ -113,8 +112,10 @@ files (SHA-256 below).
   correcting the comment; I corrected the comment / removed the dead code
   (caching would add complexity for little gain in the already-parallel
   converter).
-- **`--verify` vs `--no-verify`**: this reverts the earlier "off by default"
-  behaviour, per the review's spec-deviation finding.
+- **Verification default**: the review asked for verification ON by default, but
+  the project owner subsequently requested **off by default** with `--verify`
+  to enable it. The code follows the owner's request; `--checkpoints` implies
+  `--verify`.
 
 ## Measured timings — before vs after the review
 
@@ -140,8 +141,8 @@ trade-off.
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 cargo test
 
-# compute + verify (default)
+# compute only (default; no verification)
 ./target/release/pi --digits 100000000 --output pi_100m.txt --bench
-# compute only
-./target/release/pi --digits 100000000 --no-verify --output pi_100m.txt
+# with verification
+./target/release/pi --digits 100000000 --verify --output pi_100m.txt
 ```

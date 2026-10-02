@@ -1,7 +1,7 @@
 //! Verification layers for a computed π.
 //!
-//! Verification is run with `--verify` (and is **on by default**; `--no-verify`
-//! skips it). It consists of three independent checks:
+//! Verification is **opt-in** via `--verify` (off by default). It consists of
+//! three independent checks:
 //!
 //! A. **BBP hexadecimal spot checks**: independently recompute runs of
 //!    hexadecimal digits of π with the Bailey–Borwein–Plouffe formula and
