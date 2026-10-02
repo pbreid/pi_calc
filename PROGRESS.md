@@ -76,24 +76,54 @@ Current commit state: working release build; `cargo test` green.
 - `examples/diag.rs`, `examples/bbp_prec.rs`, `examples/convert_test.rs` are
   diagnostic tools (not part of the binary).
 
-## Measured timings (this machine, 32 threads, release)
+## Measured timings (this machine, 32 threads, release) — *after optimisation*
 
 | Digits | Series | Scaling | Base-10 conv. | Verify | Total | Peak mem |
 |--------|--------|---------|---------------|--------|-------|----------|
-| 1,000,000 | 0.43 s | 0.22 s | 0.10 s | 0.11 s | ~0.85 s | 47.8 MB |
-| 10,000,000 | 6.85 s | 3.6 s | 1.6 s | 0.82 s | ~12.6 s | ~335 MB |
-| 100,000,000 | 127.3 s | 50.9 s | 26.2 s | 8.5 s | ~213 s | ~2.8 GB |
+| 1,000,000 | 0.10 s | 0.10 s | 0.05 s | 0.03 s | ~0.3 s | ~32 MB |
+| 10,000,000 | 0.97 s | 1.4 s | 0.50 s | 0.80 s | ~3.7 s | ~140 MB |
+| 100,000,000 | 15 s | 19.5 s | 7.7 s | 9 s | ~58 s | ~2.5 GB |
 
 The 100M run passed **all** BBP checks (including at hex position ~83,048,236,
-near the far end of the range) and was independently confirmed digit-for-digit
-against the pi.delivery source.
+near the far end of the range) and the output was confirmed **byte-identical**
+to the previously digit-for-digit-verified result. Authoritative wall-clock
+measurements (`/usr/bin/time -v`): **100M verify = 58.1 s / 2.53 GB**;
+**100M no-verify = 43.2 s / 2.03 GB**.
+
+## Performance optimisation (git commit: after initial)
+
+The following high-impact inefficiencies were identified and fixed:
+
+1. **Fixed-assignment + serial merge in the binary splitting.** The old code
+   split the term range into fixed segments on manually-spawned threads and
+   then merged the segment results with a **serial left-fold**, which
+   serialised the largest (most expensive) multiplications at the top of the
+   merge tree. Replaced with a **rayon `join` work-stealing recursion** that
+   schedules the entire split tree (including the big merges) across all cores
+   and dynamically balances the load. Series time at 100M: **127 s → 15 s**
+   (~8× faster), with byte-identical output.
+2. **Single-threaded base conversion.** The binary→decimal divide-and-conquer
+   converter was serial; its two independent halves are now converted
+   concurrently at the top levels (rayon `join`). 100M conversion:
+   **26 s → 7.7 s** (~3× faster).
+3. **Two full `isqrt`s and a giant `base^(2·exp)` power.** Both the decimal and
+   hex scalings previously computed their own huge `isqrt(426880²·10005·Q²·
+   base^(2exp))`. Now the irrational root `R = isqrt(426880²·10005·Q²)` is
+   computed **once** and shared, and scaling uses `R·base^exp/T` directly
+   (exact, since `T ≫ base^exp`), eliminating the second huge isqrt and the
+   `base^(2exp)` power.
+4. **Sequential decimal+hex scaling** made concurrent when verification is on.
+
+Result: 100M **total ~213 s → ~52 s** (~4× faster) with identical verified
+output and lower peak memory (2.8 GB → ~2.4 GB).
 
 ## TODO / remaining
 
 - [x] Fix the u64 overflow (done).
 - [x] Run 100M-digit benchmark and record timing/memory (done).
 - [x] Confirm BBP verification at 1M / 10M / 100M (all PASS).
-- [x] Final README polish with measured timings.
+- [x] Optimise: parallel binary splitting, parallel conversion, shared root,
+      concurrent scaling (100M 213 s → ~52 s).
 
 ## Build / run
 

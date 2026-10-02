@@ -112,16 +112,28 @@ fn run(args: &Args) -> Result<i32, String> {
     // The irrational root R = isqrt(426880²·10005·Q²) is shared by the decimal
     // and hex scalings (computed once, not twice).
     let r = chudnovsky::chudnovsky_root(&q2);
-    let scaled = chudnovsky::scaled_integer(&r, &t, 10, d);
-    let t2 = Instant::now();
-    // The hex-scaled integer is only needed for the BBP verification; skip it
-    // entirely when verification is disabled to save a large multiply+division.
-    let (hex_scaled, used_hex_len) = if verify_on {
-        (chudnovsky::scaled_integer(&r, &t, 16, hex_len), hex_len)
+    // The decimal and hex scalings are independent (they share R and T but
+    // scale by different bases), so when verification is needed we run them
+    // concurrently. The hex-scaled integer is only needed for the BBP
+    // verification; skip it entirely when verification is disabled.
+    let (scaled, hex_scaled, used_hex_len, hex_overlapped) = if verify_on {
+        let t_sc = Instant::now();
+        let (s, h) = rayon::join(
+            || chudnovsky::scaled_integer(&r, &t, 10, d),
+            || chudnovsky::scaled_integer(&r, &t, 16, hex_len),
+        );
+        (s, h, hex_len, t_sc.elapsed())
     } else {
-        (Integer::from(1), 0usize)
+        let t_sc = Instant::now();
+        let s = chudnovsky::scaled_integer(&r, &t, 10, d);
+        (s, Integer::from(1), 0usize, t_sc.elapsed())
     };
-    let t3 = Instant::now();
+    let t2 = Instant::now();
+    // In the concurrent case the hex work is overlapped with the decimal work;
+    // record zero additional hex time so the timings stay truthful (total is
+    // unchanged).
+    let _ = hex_overlapped;
+    let t3 = t2;
 
     let result = PiResult {
         scaled,

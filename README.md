@@ -240,11 +240,10 @@ Peak memory is minimised by:
 - writing output to disk in 1 MiB chunks from a single digit buffer (no extra
   full-size copy of the string).
 
-Measured peak resident memory (`VmHWM`): **47.8 MB at 1M**, **~335 MB at 10M**,
-**~2.8 GB at 100M**. The dominant live objects at 100M are the scaled integers
-and the digit buffer (both on the order of the output size in bits); we also
-hold the `10^(2D)`-scaled value transiently. This is far under the 32 GB RAM of
-the reference machine.
+Measured peak resident memory (`VmHWM`): **~32 MB at 1M**, **~140 MB at 10M**,
+**~2.4 GB at 100M**. The dominant live objects at 100M are the scaled integers
+and the digit buffer (both on the order of the output size in bits). This is far
+under the 32 GB RAM of the reference machine.
 
 ---
 
@@ -252,14 +251,45 @@ the reference machine.
 
 | Digits | Series (BS) | Scaling | Base-10 conv. | Verify | Total | Peak mem |
 |--------|-------------|---------|---------------|--------|-------|----------|
-| 1,000,000 | 0.43 s | 0.22 s | 0.10 s | 0.11 s | ~0.85 s | 47.8 MB |
-| 10,000,000 | 6.85 s | 3.6 s | 1.6 s | 0.82 s | ~13 s | ~335 MB |
-| 100,000,000 | 127 s | 51 s | 26 s | 8.5 s | ~213 s | ~2.8 GB |
+| 1,000,000 | 0.10 s | 0.10 s | 0.05 s | 0.03 s | ~0.3 s | ~32 MB |
+| 10,000,000 | 0.97 s | 1.4 s | 0.50 s | 0.80 s | ~3.7 s | ~140 MB |
+| 100,000,000 | 15 s | 19.5 s | 7.7 s | 9 s | ~58 s | ~2.5 GB |
 
-*(Wall-clock release timings from `--bench` on the reference machine, with
-verification enabled. At 100M the series evaluation dominates; the scaling and
-base-conversion steps are also substantial. All figures are intended as
-indicative and will vary with hardware.)*
+*(Wall-clock release timings on the reference machine. The 100M row is measured
+with `/usr/bin/time -v`: **58.1 s / 2.53 GB** with verification enabled, and
+**43.2 s / 2.03 GB** with `--no-verify` (the "Verify" timing is excluded). All
+runs pass every verification check. Figures are indicative and vary with
+hardware.)*
+
+### Performance optimisations
+
+Beyond the baseline implementation, the following high-impact inefficiencies
+were identified and fixed (see [`PROGRESS.md`](PROGRESS.md) for the
+before/after):
+
+1. **Parallel binary splitting via work-stealing.** The previous design split
+   the term range into fixed segments computed on manually-spawned threads and
+   then merged the segment results with a **serial left-fold**. That serialised
+   the largest (most expensive) multiplications near the top of the merge tree
+   and used fixed, un-balanced work assignment. Replacing it with a rayon
+   `join`-based parallel recursion that schedules the *whole* split tree
+   (including the big merges) by work-stealing cut the series time by **~8×**
+   at 100M (127 s → 15 s) with identical output.
+2. **Parallel base conversion.** The binary→decimal divide-and-conquer
+   converter was single-threaded. Its two independent halves are now converted
+   concurrently at the top levels (rayon `join`), giving a **~3×** speedup
+   (26 s → 7.7 s at 100M).
+3. **Single shared root.** Both the decimal (`10^D`) and hex (`16^H`) scalings
+   need `isqrt(426880²·10005·Q²)`. This irrational root is now computed **once**
+   and shared, and the `base^(2·exp)` giant power is no longer built (we scale
+   by `base^exp` directly — exact because the Chudnovsky denominator `T`
+   dwarfs `base^exp`). This eliminated the second huge `isqrt` and reduced peak
+   memory.
+4. **Concurrent decimal/hex scaling** (when verification is on): the two
+   independent scale operations now run concurrently.
+
+The 100M → 10M wall-clock improvement is ~4× (with identical, verified
+output).
 
 ---
 

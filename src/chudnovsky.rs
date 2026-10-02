@@ -47,6 +47,7 @@
 
 use rug::ops::NegAssign;
 use rug::Integer;
+use std::time::Instant;
 
 /// `A` = 13591409
 pub const A: i64 = 13_591_409;
@@ -301,9 +302,22 @@ pub fn chudnovsky_root(q2: &Integer) -> Integer {
 /// `base^(2·exp)` power and the very large `isqrt(base^(2·exp)·…)` that a
 /// naive scaling would require.
 pub fn scaled_integer(r: &Integer, t: &Integer, base: u64, exp: usize) -> Integer {
+    let t0 = Instant::now();
     let base_pow = integer_pow(base, exp);
+    let t1 = Instant::now();
     let scaled = r * base_pow;
-    Integer::from(scaled / t)
+    let t2 = Instant::now();
+    let res = Integer::from(scaled / t);
+    let t3 = Instant::now();
+    if std::env::var("PI_SCALE_TIMING").is_ok() {
+        eprintln!(
+            "scale base={base} exp={exp}: pow={:?} mul={:?} div={:?}",
+            t1 - t0,
+            t2 - t1,
+            t3 - t2
+        );
+    }
+    res
 }
 
 /// `log10(16)` inverse = 1/log10(16) ≈ 0.83048 (converts decimal digits to hex
