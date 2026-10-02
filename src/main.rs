@@ -57,9 +57,11 @@ struct Args {
     #[arg(long, default_value = "pi.txt", value_name = "PATH")]
     output: PathBuf,
 
-    /// Skip verification (verification is on by default).
+    /// Run verification after computation (BBP spot-checks + decimal
+    /// checkpoints). Off by default: `--digits N` just computes and writes the
+    /// digits.
     #[arg(long)]
-    no_verify: bool,
+    verify: bool,
 
     /// File of externally-sourced decimal checkpoints, one per line:
     /// `<position> <digits>` (e.g. `1000000 1`).
@@ -100,7 +102,7 @@ fn run(args: &Args) -> Result<i32, String> {
     let cfg = PiConfig::new(args.digits, threads, guard);
     let d = cfg.digits + cfg.guard;
     let hex_len = chudnovsky::hex_digit_capacity(d);
-    let verify_on = !args.no_verify;
+    let verify_on = args.verify || args.checkpoints.is_some();
 
     // --- Phase 1: series evaluation (parallel binary splitting) ---
     let t0 = Instant::now();

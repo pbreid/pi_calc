@@ -36,7 +36,7 @@ Current commit state: working release build; `cargo test` green.
      result (including near the END of the range).
    - B: decimal checkpoint comparison (only first 50 digits are hardcoded).
 5. **CLI** (`src/main.rs`, `clap`): `--digits`, `--threads`, `--output`,
-   `--no-verify`, `--checkpoints`, `--bench`, plus `--guard`.
+   `--verify`, `--checkpoints`, `--bench`, plus `--guard`.
 6. **Streaming output** (`src/output.rs`).
 7. **Tests**: unit tests (known digits, indexing off-by-one, corruption,
    BBP-vs-main, checkpoint parser) and an integration test at N = 10,000.
@@ -88,7 +88,7 @@ The 100M run passed **all** BBP checks (including at hex position ~83,048,236,
 near the far end of the range) and the output was confirmed **byte-identical**
 to the previously digit-for-digit-verified result. Authoritative wall-clock
 measurements (`/usr/bin/time -v`): **100M verify = 58.1 s / 2.53 GB**;
-**100M no-verify = 43.2 s / 2.03 GB**.
+**100M without `--verify` = 43.2 s / 2.03 GB**.
 
 ## Performance optimisation (git commit: after initial)
 

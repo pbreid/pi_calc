@@ -42,7 +42,7 @@ cargo test
 ## Usage
 
 ```
-pi --digits N [--threads T] [--output PATH] [--no-verify]
+pi --digits N [--threads T] [--output PATH] [--verify]
    [--checkpoints PATH] [--bench] [--guard G]
 ```
 
@@ -51,8 +51,8 @@ pi --digits N [--threads T] [--output PATH] [--no-verify]
 | `--digits N` | Number of decimal places after the `"3."` (required). |
 | `--threads T` | Worker threads (default: all logical cores). |
 | `--output PATH` | Output file (default: `pi.txt`). Format is `"3."` followed by exactly N digits, no newlines or spaces. |
-| `--verify` | Run verification after computation (**on by default**). Use `--no-verify` to skip. |
-| `--checkpoints PATH` | File of externally-sourced decimal checkpoints, one per line: `<position> <digits>` (e.g. `1000000 1`). |
+| `--verify` | Run verification after computation (BBP spot-checks + decimal checkpoints). **Off by default** — just `pi --digits N` computes and writes the digits. |
+| `--checkpoints PATH` | File of externally-sourced decimal checkpoints, one per line: `<position> <digits>` (e.g. `1000000 1`). Only used when `--verify` is given. |
 | `--bench` | Print per-phase timing and peak memory (`VmHWM`). |
 | `--guard G` | Internal guard digits beyond N (default: 32). |
 
@@ -202,7 +202,7 @@ with `rayon` across the available cores.
 
 ## Verification design (critical)
 
-Two **independent** layers run by default after computation.
+Two **independent** layers, enabled with `--verify`, run after computation.
 
 ### A. BBP hexadecimal spot-checks
 
@@ -257,7 +257,7 @@ under the 32 GB RAM of the reference machine.
 
 *(Wall-clock release timings on the reference machine. The 100M row is measured
 with `/usr/bin/time -v`: **58.1 s / 2.53 GB** with verification enabled, and
-**43.2 s / 2.03 GB** with `--no-verify` (the "Verify" timing is excluded). All
+**43.2 s / 2.03 GB** without `--verify` (the "Verify" timing is excluded). All
 runs pass every verification check. Figures are indicative and vary with
 hardware.)*
 
