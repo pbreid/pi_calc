@@ -1,0 +1,7 @@
+# Sample decimal checkpoints (verified against an independent source:
+# the pi.delivery API, which includes the leading '3' as index 0).
+# Format: <position> <digits>  (position 1 = first digit after "3.").
+100001 41260
+1000000 1
+5000000 5
+10000000 725915133
