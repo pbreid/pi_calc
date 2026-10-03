@@ -133,8 +133,11 @@ the recursion therefore **skips computing `P` entirely**, saving the single
 largest multiplication at the root merge.
 
 > **Note:** the leaf numerator `(6k−5)(2k−1)(6k−1)` exceeds `u64` for
-> `k ≳ 635,000` and must be multiplied as big integers (see the overflow bug in
-> [`PROGRESS.md`](PROGRESS.md)).
+> `k ≳ 635,000`, and the whole leaf `t_k = p_k·(A+B·k)` exceeds `u128` for
+> `k ≳ 7.3M`. Leaves up to `k = 7,000,000` are therefore computed natively in
+> `u128` (verified against the big-integer path at the boundary); beyond that
+> they fall back to big-integer arithmetic, so any digit count works (see the
+> overflow bug in [`PROGRESS.md`](PROGRESS.md)).
 
 ### Scaling to the binary fixed-point value (working precision)
 
@@ -179,8 +182,11 @@ floor(π·10^D) = floor(M·10^D / 2^W) = (M·5^D) >> (W − D)
 
 The error in `M` is `< 2` bits, so the error in `π·10^D` is
 `< 2·10^D/2^W ≤ 2^(1−192) < 2^(−190)`, which cannot change the floor. The
-result is exactly `floor(π·10^D)`; we then drop the `guard` digits by dividing
-by `10^guard` to get the correctly **truncated** digit string (never rounded).
+result is exactly `floor(π·10^D)`. Since `floor(floor(x)/n) = floor(x/n)` for
+integer `n ≥ 1`, the `guard`-digit truncation folds into the same shift:
+`(M·5^(D−guard)) >> (W − digits)`, computed with one fused shift and no
+full-size division — the digit string is correctly **truncated** (never
+rounded).
 
 ### Guard digits and term count
 
@@ -199,6 +205,15 @@ work-stealing recursion** over the whole tree (down to a leaf threshold of
 the top, which a fixed-segment scheme would serialise — are scheduled across all
 cores. The merge is exact and associative, so the result is deterministic
 regardless of scheduling (verified identical across 1 vs 32 threads).
+
+GMP's multiplication itself is single-threaded, so the few largest merges would
+still serialise: at 100M digits the root merge alone (two ~413M-bit products)
+costs ~3.5 s. Large operands are therefore **split for concurrency**: `a·b` with
+`b = b_hi·2^s + b_lo` (s a limb boundary) becomes `a·b_hi·2^s + a·b_lo`, with
+the two half-size products computed on different threads (recursively, to ~4
+sub-multiplies for operands ≥ 96M bits). This is exact, so determinism is
+unaffected; the same helper parallelises `Qh²` in the binary scaling and
+`M·5^D` in the decimal scaling.
 
 An earlier design split the range into fixed segments computed on
 manually-spawned threads and merged them with a **serial left-fold**; that
@@ -264,11 +279,16 @@ The final output is compared against `--checkpoints`, plus the hardcoded first
 
 Peak memory is minimised by:
 - truncating `Q`/`T` to the working precision before the expensive scaling;
-- freeing P/Q/T intermediates as soon as they are merged;
+- freeing P/Q/T intermediates as soon as they are merged (the merge forms its
+  products in an order that drops each operand as soon as it is consumed);
 - rendering the decimal digits directly with the leading `"3"` dropped (no
   second full-size copy of the digit buffer);
 - extracting hex nibbles directly from `M` (no full hex string is built);
-- streaming output to disk in 1 MiB chunks.
+- streaming output to disk in 1 MiB chunks;
+- on Linux, raising glibc's mmap threshold so freed multi-MB GMP operands are
+  returned to the OS instead of being hoarded in per-thread malloc arenas
+  (≈1.36 GB vs ≈2.1 GB peak at 100M digits, ≈4% slower; set `PI_STD_MALLOC=1`
+  to keep the default allocator behavior).
 
 ---
 
@@ -276,33 +296,49 @@ Peak memory is minimised by:
 
 All times are wall-clock release timings on the reference machine with
 verification enabled. "Scaling" merges the binary scaling and decimal scaling
-phases.
+phases. The "round 2" rows are the follow-up optimization pass (parallel split
+multiplication, `u128` leaves, fused div/rem conversion, folded guard, Barrett
+modpow, allocator tuning); see PROGRESS.md for what changed.
 
 | Digits | | Series | Scaling | Conv. | Verify | Total | Peak mem |
 |--------|--|--------|---------|-------|--------|-------|----------|
 | 1,000,000 | before | 0.060 s | 0.083 s | 0.034 s | 0.139 s | 0.317 s | 38.3 MB |
 | 1,000,000 | after  | 0.052 s | 0.047 s | 0.039 s | 0.266 s | 0.406 s | 27.9 MB |
+| 1,000,000 | round 2 | 0.066 s | 0.048 s | 0.022 s | 0.243 s | 0.379 s | 15.1 MB |
 | 10,000,000 | before | 0.94 s | 1.42 s | 0.51 s | 0.81 s | 3.68 s | 356 MB |
 | 10,000,000 | after  | 0.88 s | 0.69 s | 0.48 s | 1.44 s | 3.50 s | 204 MB |
+| 10,000,000 | round 2 | 0.84 s | 0.73 s | 0.29 s | 0.83 s | 2.70 s | 115 MB |
 | 100,000,000 | before | 15.3 s | 19.5 s | 7.7 s | 9.1 s | ~51.6 s¹ | 2.53 GB |
 | 100,000,000 | after  | 13.6 s | 9.4 s | 7.3 s | 14.8 s | 45.2 s | 1.67 GB |
+| 100,000,000 | round 2 | 9.4 s | 8.6 s | 4.1 s | 8.2 s | 30.5 s | 1.36 GB |
 
 ¹ Before, 100M verification-on wall clock was **58.1 s** (`/usr/bin/time -v`);
-the in-process phase sum was ~51.6 s. After, it is **45.2 s**.
+the in-process phase sum was ~51.6 s. After, it is **45.2 s**; round 2,
+**30.5 s**. Compute-only (no `--verify`) at 100M: 28.7 s → **21.9–22.2 s**
+(round 2), peak 1.69 GB → **1.36 GB**.
 
 Observations:
 
 - **Scaling** dropped from 19.5 s to 9.4 s at 100M (the review's ~2.5×
   estimate), and **peak memory** from 2.53 GB to 1.67 GB, because `Q`/`T` are
   truncated to the working precision and the second (hex) division is gone.
-- **Series** improved ~10% by skipping `P` on the right spine (15.3 s → 13.6 s).
+- **Series** improved ~10% by skipping `P` on the right spine (15.3 s → 13.6 s)
+  and a further ~30% in round 2 (9.4 s): `u128` term leaves plus a parallel
+  split multiplication for the top-of-tree merges (GMP itself is
+  single-threaded). The root merge's two ~413M-bit products now run as four
+  ~206M-bit multiplies on separate threads.
 - **Verification** now costs more (more positions, multi-digit runs, and the
   modular conversion check) — that is the intended trade-off for stronger,
-  independent checks. The **conversion check itself costs 0.156 s at 100M**, a
-  ~2% fraction of the 7.3 s base conversion.
+  independent checks. Round 2 cut it ~45% (14.8 s → 8.2 s) with a per-`modpow`
+  Barrett reciprocal in the BBP sums (one division per term instead of ~40).
+  The **conversion check itself costs 0.156 s at 100M**, a ~2% fraction of the
+  base conversion.
+- **Base conversion** dropped 7.3 s → 4.1 s at 100M by computing each split's
+  quotient and remainder in one fused `mpz_tdiv_qr` pass (the previous code
+  performed two full divisions per node), plus a cheaper leaf base case.
 - At 1M the total is slightly higher than before because the stronger
   verification (≈15 BBP positions plus the modular check) dominates the tiny
-  computation.
+  computation; round 2 brings it back below the original 0.317 s.
 
 The 1M / 10M / 100M outputs are **byte-identical** to the previously verified
 files:

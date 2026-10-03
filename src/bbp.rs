@@ -64,13 +64,38 @@ pub const MAX_RUN: usize = 8;
 
 /// Modular exponentiation `base^exp mod m`.
 ///
-/// The products are formed in `u128` so the routine is correct for moduli up
-/// to (and beyond) `2^32`; with `u64` products it would overflow once the
-/// modulus exceeds ≈`2^32`.
+/// For `m < 2^32` (the BBP case: `m = 8k+j < 8n+6`) the products fit in `u64`
+/// and a per-`modpow` Barrett reciprocal replaces the hardware division in
+/// every reduction — one `u64` division to compute `μ = floor(2^64/m)`, then
+/// each of the ~`2·log₂ exp` reductions costs two multiplies instead of one
+/// 64-bit division. For `m ≥ 2^32` the products are formed in `u128` (a `u64`
+/// intermediate would overflow once the modulus exceeds ≈`2^32`).
 pub fn modpow(mut base: u64, mut exp: usize, m: u64) -> u64 {
     debug_assert!(m > 0);
+    if m == 1 {
+        return 0;
+    }
     let mut result = 1u64 % m;
     base %= m;
+    if m < 1 << 32 {
+        // Barrett: μ = floor(2^64/m) (fits u64 for m ≥ 2). For x < m² < 2^64,
+        // q = floor(x·μ / 2^64) ∈ {floor(x/m) − 1, floor(x/m)}, so
+        // r = x − q·m < 2m and one conditional subtraction finishes.
+        let mu = ((1u128 << 64) / u128::from(m)) as u64;
+        let red = |x: u64| -> u64 {
+            let q = (((x as u128) * (mu as u128)) >> 64) as u64;
+            let r = x - q * m;
+            if r >= m { r - m } else { r }
+        };
+        while exp > 0 {
+            if exp & 1 == 1 {
+                result = red(result * base);
+            }
+            base = red(base * base);
+            exp >>= 1;
+        }
+        return result;
+    }
     let m128 = m as u128;
     while exp > 0 {
         if exp & 1 == 1 {
@@ -229,6 +254,46 @@ mod tests {
             let (d, frac) = hex_digit_checked(n, 2);
             assert!(d <= 15, "digit {d} out of range at n={n}");
             assert!((0.0..16.0).contains(&frac), "frac out of range at n={n}: {frac}");
+        }
+    }
+
+    /// The Barrett fast path (`m < 2^32`) must agree exactly with the u128
+    /// reference path, including even moduli (`8k+4`) and `m = 2`.
+    #[test]
+    fn modpow_barrett_path_matches_reference() {
+        let reference = |base: u64, exp: usize, m: u64| -> u64 {
+            let m128 = u128::from(m);
+            let mut result = 1u64 % m;
+            let mut base = base % m;
+            let mut exp = exp;
+            while exp > 0 {
+                if exp & 1 == 1 {
+                    result = ((u128::from(result) * u128::from(base)) % m128) as u64;
+                }
+                base = ((u128::from(base) * u128::from(base)) % m128) as u64;
+                exp >>= 1;
+            }
+            result
+        };
+        // A LCG sweep over small/odd/even/large-below-2^32 moduli.
+        let mut state: u64 = 0x243F_6A88_85A3_08D3;
+        for _ in 0..2000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let m = (state % (1u64 << 32)).max(2);
+            let base = state >> 33;
+            let exp = ((state >> 20) % 5000) as usize;
+            assert_eq!(
+                modpow(base, exp, m),
+                reference(base, exp, m),
+                "modpow({base},{exp},{m})"
+            );
+        }
+        for m in [2u64, 3, 4, 8, 9, (1u64 << 31) + 1, (1u64 << 32) - 1] {
+            for exp in [0usize, 1, 2, 3, 17, 1000] {
+                assert_eq!(modpow(7, exp, m), reference(7, exp, m), "m={m} exp={exp}");
+            }
         }
     }
 

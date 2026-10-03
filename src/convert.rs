@@ -26,7 +26,7 @@
 //! The two halves of each split are independent, so the top `PAR_DEPTH` levels
 //! are converted concurrently with `rayon::join`.
 
-use rug::Integer;
+use rug::{Complete, Integer};
 
 /// The radix used for the conversion is 10^9 so each "block" fits in a `u32`
 /// and corresponds directly to exactly 9 decimal characters.
@@ -110,14 +110,19 @@ fn convert_blocks(x: &Integer) -> Vec<u32> {
 }
 
 fn convert_blocks_depth(x: &Integer, depth: usize) -> Vec<u32> {
-    if x < &Integer::from(RADIX) {
-        return vec![x.to_u32().expect("fits in u32")];
+    // Fast small-value exit without allocating a comparison Integer (this is
+    // the base case for every ~9-digit block, ~11M times at 100M digits).
+    if let Some(v) = x.to_u64() {
+        if v < RADIX {
+            return vec![v as u32];
+        }
     }
 
     let m = half_power(x);
     let rpow = Integer::from(Integer::u_pow_u(RADIX as u32, m as u32));
-    let hi = Integer::from(x / &rpow);
-    let lo = Integer::from(x % &rpow);
+    // One fused division pass (mpz_tdiv_qr) instead of separate `/` and `%`,
+    // which would each walk the full dividend.
+    let (hi, lo) = x.div_rem_ref(&rpow).complete();
 
     // The low part is converted first and padded to exactly `m` blocks so the
     // high part lands at the correct block position. Internal zero blocks are

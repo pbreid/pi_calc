@@ -92,7 +92,7 @@
 //! result is therefore exactly `floor(π·10^D)`.
 
 use rug::ops::NegAssign;
-use rug::Integer;
+use rug::{Complete, Integer};
 
 /// `A` = 13591409
 pub const A: i64 = 13_591_409;
@@ -124,6 +124,76 @@ const WORK_BITS_GUARD: usize = 192;
 /// Extra bits used when truncating `Q`/`T` (`Wm = W + TRUNC_GUARD`).
 const TRUNC_GUARD: usize = 128;
 
+/// Largest `k` for which the `u128` leaf arithmetic is exact. The binding
+/// constraint is `|t_k| = p_k·(A+B·k) ≈ 216·B·k⁴ ≤ 2^128`, which holds up to
+/// `k ≈ 7.33e6`; `7_000_000` is safely inside that. Beyond this the big-integer
+/// leaf path is used (so arbitrary digit counts keep working). Checked by
+/// `u128_leaf_matches_big_path`.
+const K_U128_MAX: usize = 7_000_000;
+
+/// Operands at least this many bits are split for concurrent multiplication
+/// (GMP's multiplication itself is single-threaded).
+const PAR_SPLIT_MIN_BITS: usize = 96_000_000;
+/// Minimum size of the *smaller* operand for a split to pay off (below this a
+/// multiplication is already near-linear).
+const PAR_SPLIT_MIN_SMALL_BITS: usize = 1_000_000;
+/// Maximum split recursion depth (depth 2 → up to 4 concurrent sub-multiplies).
+const PAR_SPLIT_DEPTH: u32 = 2;
+
+/// `a · b`, exact. For huge operands, splits the larger operand at a 64-bit
+/// limb boundary and computes the two half-size products concurrently:
+/// `a·(b_hi·2^s + b_lo) = a·b_hi·2^s + a·b_lo`. Deterministic (exact integer
+/// arithmetic) regardless of scheduling.
+fn par_mul(a: &Integer, b: &Integer, depth: u32) -> Integer {
+    par_mul_split(a, b, depth, PAR_SPLIT_MIN_BITS, PAR_SPLIT_MIN_SMALL_BITS, PAR_SPLIT_DEPTH)
+}
+
+/// The general form of [`par_mul`] with the split thresholds/depth injected
+/// (used by tests to exercise the split path on small operands).
+fn par_mul_split(
+    a: &Integer,
+    b: &Integer,
+    depth: u32,
+    min_bits: usize,
+    min_small_bits: usize,
+    max_depth: u32,
+) -> Integer {
+    let a_bits = a.significant_bits().max(0) as usize;
+    let b_bits = b.significant_bits().max(0) as usize;
+    if depth < max_depth
+        && a_bits.max(b_bits) >= min_bits
+        && a_bits.min(b_bits) >= min_small_bits
+    {
+        let (big, small) = if a_bits >= b_bits { (a, b) } else { (b, a) };
+        let s = ((big.significant_bits().max(0) as usize) / 2) & !63;
+        // `keep_bits_ref` (`mpz_fdiv_r_2exp`) and `>>` (`mpz_fdiv_q_2exp`) are
+        // the floor pair, so `big = hi·2^s + lo` holds exactly for any sign.
+        let lo: Integer = big.keep_bits_ref(s as u32).complete();
+        let hi = (big >> s).complete();
+        let (lo_prod, hi_prod) = rayon::join(
+            || par_mul_split(&lo, small, depth + 1, min_bits, min_small_bits, max_depth),
+            || par_mul_split(&hi, small, depth + 1, min_bits, min_small_bits, max_depth),
+        );
+        let mut r = hi_prod << s;
+        r += &lo_prod;
+        return r;
+    }
+    (a * b).complete()
+}
+
+/// `5^e`, using a parallel squaring for huge exponents (`u_pow_u` is serial).
+fn five_pow(e: usize) -> Integer {
+    if e < PAR_SPLIT_MIN_BITS / 3 {
+        return Integer::from(Integer::u_pow_u(5, e as u32));
+    }
+    let h = Integer::from(Integer::u_pow_u(5, (e / 2) as u32));
+    let mut p = par_mul(&h, &h, 0);
+    if e % 2 == 1 {
+        p *= 5;
+    }
+    p
+}
+
 /// A computed value of π.
 pub struct PiResult {
     /// `M = floor(π · 2^w_bits)` — the main computation's *binary* result. Its
@@ -146,14 +216,14 @@ impl PiResult {
     /// The truncated integer `floor(π·10^digits)`, whose decimal representation
     /// is `"3"` followed by exactly `digits` digits.
     ///
-    /// Uses `floor(π·10^D) = (M·5^D) >> (W − D)` (see the module docs), then
-    /// removes the `guard` extra digits by `floor(·/10^guard)`.
+    /// Uses `floor(π·10^D) = (M·5^D) >> (W − D)` (see the module docs). Since
+    /// `floor(floor(x)/n) = floor(x/n)` for integer `n ≥ 1`, the final division
+    /// by `10^guard` folds into the shift: the result is exactly
+    /// `(M·5^(D−guard)) >> (W − digits)`.
     pub fn decimal_truncated(&self) -> Integer {
-        let d = self.digits + self.guard;
-        let pow5 = Integer::from(Integer::u_pow_u(5, d as u32));
-        let scaled = Integer::from((&self.binary * pow5) >> (self.w_bits - d));
-        let g = Integer::from(Integer::u_pow_u(10, self.guard as u32));
-        Integer::from(scaled / g)
+        let pow5 = five_pow(self.digits);
+        let prod = par_mul(&self.binary, &pow5, 0);
+        Integer::from(prod >> (self.w_bits - self.digits))
     }
 
     /// Return exactly `digits` decimal digits (after the "3.") as a `String`.
@@ -279,8 +349,17 @@ fn leaf(k: usize) -> (Integer, Integer, Integer) {
         // s_0 = A. The recurrence leaf contributes P=1, Q=1, T=A.
         return (Integer::from(1), Integer::from(1), Integer::from(A));
     }
+    if k <= K_U128_MAX {
+        // p_k, q_k and |t_k| all fit in u128 here (|t_k| is binding); computing
+        // them natively avoids ~6 GMP operations and allocations per term.
+        let k = k as u128;
+        let p = (6 * k - 5) * (2 * k - 1) * (6 * k - 1);
+        let q = k * k * k * C3_OVER_24;
+        let t = p * ((A as u128) + (B as u128) * k);
+        // The (−1)^k sign is folded into p_k (see module docs).
+        return (-Integer::from(p), Integer::from(q), -Integer::from(t));
+    }
     // p_k = (6k−5)(2k−1)(6k−1); q_k = k³·(C3/24).
-    // The (−1)^k sign is folded into p_k.
     //
     // NOTE: the product (6k−5)(2k−1)(6k−1) exceeds u64 for k ≳ 635,000, so we
     // MUST multiply as big integers (each factor fits in u64, the product does
@@ -299,18 +378,28 @@ fn leaf(k: usize) -> (Integer, Integer, Integer) {
 
 /// Merge two binary-splitting triples. The `P` product is only computed when
 /// `need_p` is true (see [`chudnovsky_bs`]).
+///
+/// The products are formed in an order that drops each operand as soon as it
+/// is consumed; at the top levels this halves the peak live memory versus
+/// holding all three products at once.
 fn merge(
     (p1, q1, t1): (Integer, Integer, Integer),
     (p2, q2, t2): (Integer, Integer, Integer),
     need_p: bool,
 ) -> (Integer, Integer, Integer) {
-    let q = Integer::from(&q1 * &q2);
-    let t = Integer::from(&t1 * &q2) + Integer::from(&p1 * &t2);
-    let p = if need_p {
-        Integer::from(&p1 * &p2)
-    } else {
-        Integer::from(1)
-    };
+    let p = if need_p { par_mul(&p1, &p2, 0) } else { Integer::from(1) };
+    drop(p2);
+    let pt = par_mul(&p1, &t2, 0);
+    drop(p1);
+    drop(t2);
+    let tq = par_mul(&t1, &q2, 0);
+    drop(t1);
+    let q = par_mul(&q1, &q2, 0);
+    drop(q1);
+    drop(q2);
+    let mut t = tq;
+    t += &pt;
+    drop(pt);
     (p, q, t)
 }
 
@@ -324,7 +413,7 @@ pub fn compute_pi(cfg: &PiConfig) -> PiResult {
     let (q, t, n_terms) = chudnovsky_split(cfg);
     let d = cfg.digits + cfg.guard;
     let (w_bits, hex_len) = working_precision(d);
-    let binary = binary_pi_fixed(&q, &t, w_bits);
+    let binary = binary_pi_fixed(q, t, w_bits);
     PiResult { binary, w_bits, digits: cfg.digits, guard: cfg.guard, n_terms, hex_len }
 }
 
@@ -338,18 +427,26 @@ pub fn chudnovsky_split(cfg: &PiConfig) -> (Integer, Integer, usize) {
 
 /// Compute the binary fixed-point value `M ≈ floor(π·2^w_bits)` from `Q, T`,
 /// using truncated operands (see the module docs for the error bound).
-pub fn binary_pi_fixed(q: &Integer, t: &Integer, w_bits: usize) -> Integer {
+///
+/// Takes `Q` and `T` by value and shifts them in place so the full-size
+/// originals are freed before the expensive `isqrt`/division steps.
+pub fn binary_pi_fixed(q: Integer, t: Integer, w_bits: usize) -> Integer {
     let wm = w_bits + TRUNC_GUARD;
     let bits = (q.significant_bits().max(t.significant_bits())) as usize;
     let a = bits.saturating_sub(wm);
-    let qh = Integer::from(q >> a);
-    let th = Integer::from(t >> a);
+    let mut qh = q;
+    let mut th = t;
+    qh >>= a;
+    th >>= a;
     // G = isqrt(426880²·10005·Qh²)
     let x = Integer::from(PI_K).square() * Integer::from(TEN_THOUSAND_FIVE)
-        * Integer::from(&qh * &qh);
+        * par_mul(&qh, &qh, 0);
+    drop(qh);
     let g = isqrt(&x);
+    drop(x);
     // M = floor(G · 2^W / Th)
-    let shifted = Integer::from(&g << w_bits);
+    let shifted = (&g << w_bits).complete();
+    drop(g);
     Integer::from(shifted / &th)
 }
 
@@ -438,6 +535,80 @@ fn split_sum(a: usize, b: usize) -> rug::Rational {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The split path must be exactly `a * b` for every sign combination and
+    /// size around the thresholds. Small thresholds let us exercise the
+    /// recursive splits (including the negative operands that occur for `P`
+    /// and `T`) on tiny values.
+    #[test]
+    fn par_mul_split_matches_direct_product() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |bits: usize| -> Integer {
+            let mut acc = Integer::from(0);
+            let mut remaining = bits;
+            while remaining > 0 {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let chunk_bits = remaining.min(64);
+                let chunk = Integer::from(state & ((1u128 << chunk_bits) - 1) as u64);
+                acc = (acc << chunk_bits) | chunk;
+                remaining -= chunk_bits;
+            }
+            acc
+        };
+        for bits in [64usize, 1000, 1024, 1025, 4096, 10_000, 33_000] {
+            for &(neg_a, neg_b) in
+                &[(false, false), (true, false), (false, true), (true, true)]
+            {
+                let a = next(bits);
+                let b = next(bits / 2 + 7);
+                let a = if neg_a { -a } else { a };
+                let b = if neg_b { -b } else { b };
+                let direct = (&a * &b).complete();
+                let split = par_mul_split(&a, &b, 0, 1024, 64, 2);
+                assert!(
+                    split == direct,
+                    "par_mul mismatch: bits={bits} signs=({neg_a},{neg_b})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn u128_leaf_matches_big_path() {
+        // Reference: the exact big-integer leaf (the `k > K_U128_MAX` path).
+        let big_leaf = |k: usize| -> (Integer, Integer, Integer) {
+            let p = Integer::from((6 * k - 5) as u64)
+                * Integer::from((2 * k - 1) as u64)
+                * Integer::from((6 * k - 1) as u64);
+            let mut p = p;
+            p.neg_assign();
+            let k_big = Integer::from(k);
+            let k2 = Integer::from(&k_big * &k_big);
+            let q = k2 * &k_big * Integer::from(C3_OVER_24);
+            let t = &p * Integer::from(A + B * (k as i64));
+            (p, q, t)
+        };
+        // Both sides of the u128 fallback boundary (a u128 overflow would
+        // silently wrap in release and fail this equality).
+        for k in [
+            1usize,
+            2,
+            3,
+            635_000,
+            635_001,
+            1_000_000,
+            K_U128_MAX - 1,
+            K_U128_MAX,
+            K_U128_MAX + 1,
+            K_U128_MAX + 2,
+        ] {
+            let a = leaf(k);
+            let b = big_leaf(k);
+            assert!(a.0 == b.0 && a.1 == b.1 && a.2 == b.2, "leaf mismatch at k={k}");
+        }
+    }
 
     #[test]
     fn binary_split_matches_brute_force() {
